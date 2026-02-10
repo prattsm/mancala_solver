@@ -2,23 +2,34 @@
 
 from __future__ import annotations
 
-from typing import Dict, List, Optional, Tuple
+from dataclasses import dataclass
 from pathlib import Path
-import json
+from typing import Dict, List, Optional, Tuple
+import gzip
+import pickle
 
 from mancala_engine import (
     OPP,
     YOU,
     State,
-    apply_move,
-    apply_move_with_info,
-    final_diff,
+    apply_move_fast_with_info,
     is_terminal,
     legal_moves,
 )
 
 INF = 10**9
-CACHE_VERSION = 3
+CACHE_VERSION = 4
+
+EXACT = 0
+LOWER = 1
+UPPER = 2
+
+
+@dataclass(frozen=True)
+class TTEntry:
+    value: int
+    flag: int
+    best_move: Optional[int]
 
 
 def state_key(state: State) -> str:
@@ -47,14 +58,14 @@ def key_to_state(key: str) -> Optional[State]:
 
 
 def default_cache_path() -> Path:
-    return Path.home() / ".mancala_cache.json"
+    return Path.home() / ".mancala_cache.pkl.gz"
 
 
-def load_tt(path: Path) -> Dict[State, int]:
+def load_tt(path: Path) -> Dict[State, TTEntry]:
     try:
-        with path.open("r", encoding="utf-8") as handle:
-            raw = json.load(handle)
-    except (OSError, json.JSONDecodeError):
+        with gzip.open(path, "rb") as handle:
+            raw = pickle.load(handle)
+    except (OSError, pickle.PickleError, EOFError):
         return {}
 
     if not isinstance(raw, dict):
@@ -65,96 +76,205 @@ def load_tt(path: Path) -> Dict[State, int]:
     if not isinstance(raw_tt, dict):
         return {}
 
-    tt: Dict[State, int] = {}
-    for key, value in raw_tt.items():
+    tt: Dict[State, TTEntry] = {}
+    for key, entry in raw_tt.items():
         if not isinstance(key, str):
             continue
+        if not isinstance(entry, tuple) or len(entry) != 3:
+            continue
+        value, flag, best_move = entry
         if not isinstance(value, int):
+            continue
+        if flag not in {EXACT, LOWER, UPPER}:
+            continue
+        if best_move is not None and not isinstance(best_move, int):
             continue
         state = key_to_state(key)
         if state is None:
             continue
-        tt[state] = value
+        tt[state] = TTEntry(value, flag, best_move)
     return tt
 
 
-def save_tt(tt: Dict[State, int], path: Path) -> None:
+def save_tt(tt: Dict[State, TTEntry], path: Path) -> None:
     try:
         path.parent.mkdir(parents=True, exist_ok=True)
         data = {
             "version": CACHE_VERSION,
-            "tt": {state_key(state): value for state, value in tt.items()},
+            "tt": {state_key(state): (entry.value, entry.flag, entry.best_move) for state, entry in tt.items()},
         }
         tmp_path = path.with_suffix(path.suffix + ".tmp") if path.suffix else path.with_name(path.name + ".tmp")
-        with tmp_path.open("w", encoding="utf-8") as handle:
-            json.dump(data, handle, separators=(",", ":"))
+        with gzip.open(tmp_path, "wb") as handle:
+            pickle.dump(data, handle, protocol=pickle.HIGHEST_PROTOCOL)
         tmp_path.replace(path)
     except OSError:
         return
 
 
-def ordered_moves(state: State) -> List[int]:
+def terminal_diff(state: State) -> int:
+    pits_you = sum(state.pits_you)
+    pits_opp = sum(state.pits_opp)
+    store_you = state.store_you
+    store_opp = state.store_opp
+    if pits_you == 0:
+        store_opp += pits_opp
+    if pits_opp == 0:
+        store_you += pits_you
+    return store_you - store_opp
+
+
+def normalize_state(state: State) -> Tuple[State, int]:
+    if state.to_move == YOU:
+        return state, 1
+    return State(YOU, state.pits_opp, state.pits_you, state.store_opp, state.store_you), -1
+
+
+def normalize_value_flag(value: int, flag: int, sign: int) -> Tuple[int, int]:
+    if sign == 1:
+        return value, flag
+    value = -value
+    if flag == LOWER:
+        flag = UPPER
+    elif flag == UPPER:
+        flag = LOWER
+    return value, flag
+
+
+def denormalize_value_flag(value: int, flag: int, sign: int) -> Tuple[int, int]:
+    return normalize_value_flag(value, flag, sign)
+
+
+def _tt_best_move(state: State, tt: Dict[State, TTEntry]) -> Optional[int]:
+    norm_state, _ = normalize_state(state)
+    entry = tt.get(norm_state)
+    return entry.best_move if entry is not None else None
+
+
+def ordered_children(state: State, tt: Dict[State, TTEntry]) -> List[Tuple[int, State, bool, bool, int]]:
     moves = legal_moves(state)
-    scored = []
-    for move in moves:
-        info = apply_move_with_info(state, move)
+    if not moves:
+        return []
+
+    best_first = _tt_best_move(state, tt)
+    children: List[Tuple[int, State, bool, bool, int]] = []
+
+    if best_first in moves:
+        moves.remove(best_first)
+        child_state, extra_turn, capture = apply_move_fast_with_info(state, best_first)
         if state.to_move == YOU:
-            store_gain = info.state.store_you - state.store_you
+            store_gain = child_state.store_you - state.store_you
         else:
-            store_gain = info.state.store_opp - state.store_opp
-        scored.append((info.extra_turn, info.capture, store_gain, move))
-    scored.sort(reverse=True)
-    return [m for _, _, _, m in scored]
+            store_gain = child_state.store_opp - state.store_opp
+        children.append((best_first, child_state, extra_turn, capture, store_gain))
+
+    rest: List[Tuple[int, State, bool, bool, int]] = []
+    for move in moves:
+        child_state, extra_turn, capture = apply_move_fast_with_info(state, move)
+        if state.to_move == YOU:
+            store_gain = child_state.store_you - state.store_you
+        else:
+            store_gain = child_state.store_opp - state.store_opp
+        rest.append((move, child_state, extra_turn, capture, store_gain))
+
+    rest.sort(key=lambda item: (item[2], item[3], item[4]), reverse=True)
+
+    if children:
+        return children + rest
+    return rest
 
 
-def search(state: State, alpha: int, beta: int, tt: Dict[State, int]) -> int:
+def search(state: State, alpha: int, beta: int, tt: Dict[State, TTEntry]) -> int:
     if is_terminal(state):
-        return final_diff(state)
+        return terminal_diff(state)
 
-    if state in tt:
-        return tt[state]
+    alpha0, beta0 = alpha, beta
+    norm_state, sign = normalize_state(state)
+    entry = tt.get(norm_state)
+    if entry is not None:
+        value, flag = denormalize_value_flag(entry.value, entry.flag, sign)
+        if flag == EXACT:
+            return value
+        if flag == LOWER:
+            alpha = max(alpha, value)
+        elif flag == UPPER:
+            beta = min(beta, value)
+        if alpha >= beta:
+            return value
+
+    best_move: Optional[int] = None
+    children = ordered_children(state, tt)
+    if not children:
+        return terminal_diff(state)
 
     if state.to_move == YOU:
         best = -INF
-        for move in ordered_moves(state):
-            val = search(apply_move(state, move), alpha, beta, tt)
+        for move, child_state, _, _, _ in children:
+            val = search(child_state, alpha, beta, tt)
             if val > best:
                 best = val
-            if best > alpha:
-                alpha = best
+                best_move = move
+            alpha = max(alpha, best)
             if alpha >= beta:
                 break
     else:
         best = INF
-        for move in ordered_moves(state):
-            val = search(apply_move(state, move), alpha, beta, tt)
+        for move, child_state, _, _, _ in children:
+            val = search(child_state, alpha, beta, tt)
             if val < best:
                 best = val
-            if best < beta:
-                beta = best
+                best_move = move
+            beta = min(beta, best)
             if alpha >= beta:
                 break
 
-    tt[state] = best
+    if best_move is None:
+        best_move = children[0][0]
+
+    if best <= alpha0:
+        flag = UPPER
+    elif best >= beta0:
+        flag = LOWER
+    else:
+        flag = EXACT
+
+    value_norm, flag_norm = normalize_value_flag(best, flag, sign)
+    tt[norm_state] = TTEntry(value_norm, flag_norm, best_move)
     return best
 
 
 def best_move(
     state: State,
     topn: int = 3,
-    tt: Optional[Dict[State, int]] = None,
+    tt: Optional[Dict[State, TTEntry]] = None,
 ) -> Tuple[Optional[int], int, List[Tuple[int, int]]]:
     if tt is None:
         tt = {}
 
-    moves = ordered_moves(state)
-    if not moves:
-        return None, final_diff(state), []
+    children = ordered_children(state, tt)
+    if not children:
+        return None, terminal_diff(state), []
 
     scored = []
-    for move in moves:
-        val = search(apply_move(state, move), -INF, INF, tt)
-        scored.append((move, val))
+    if state.to_move == YOU:
+        alpha = -INF
+        beta = INF
+        best_val = -INF
+        for move, child_state, _, _, _ in children:
+            val = search(child_state, alpha, beta, tt)
+            scored.append((move, val))
+            if val > best_val:
+                best_val = val
+            alpha = max(alpha, best_val)
+    else:
+        alpha = -INF
+        beta = INF
+        best_val = INF
+        for move, child_state, _, _, _ in children:
+            val = search(child_state, alpha, beta, tt)
+            scored.append((move, val))
+            if val < best_val:
+                best_val = val
+            beta = min(beta, best_val)
 
     if state.to_move == YOU:
         scored.sort(key=lambda x: x[1], reverse=True)

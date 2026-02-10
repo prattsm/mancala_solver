@@ -1,6 +1,6 @@
 .venv/
 __pycache__/
 *.pyc
-.mancala_cache.json
+.mancala_cache.*
 *.md
 !README.md

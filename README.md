@@ -44,4 +44,4 @@ python3 -m unittest discover -s tests
 ## Notes
 - Board display shows opponent pits left-to-right as `1..6` and your pits left-to-right as `6..1`.
 - Evaluation is `your_store - opponent_store` at terminal.
-- The solver cache is stored at `~/.mancala_cache.json` and reused across sessions.
+- The solver cache is stored at `~/.mancala_cache.pkl.gz` and reused across sessions.

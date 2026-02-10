@@ -100,12 +100,128 @@ def final_diff(state: State) -> int:
 
 
 def apply_move(state: State, pit_num: int) -> State:
-    return apply_move_with_info(state, pit_num).state
+    return apply_move_fast(state, pit_num)
+
+
+def apply_move_fast(state: State, pit_num: int) -> State:
+    return apply_move_fast_with_info(state, pit_num)[0]
+
+
+def apply_move_fast_with_info(state: State, pit_num: int) -> tuple[State, bool, bool]:
+    new_state, extra_turn, capture = _apply_move_fast(state, pit_num)
+    return new_state, extra_turn, capture
 
 
 def apply_move_with_info(state: State, pit_num: int) -> MoveInfo:
     new_state, extra_turn, capture, trace = _apply_move(state, pit_num)
     return MoveInfo(new_state, extra_turn, capture, trace)
+
+
+def _sow(
+    pits_you: List[int],
+    pits_opp: List[int],
+    store_you: int,
+    store_opp: int,
+    mover: str,
+    pit_index: int,
+    record_drops: bool,
+) -> tuple[List[int], List[int], int, int, int, DropLocation, Optional[List[DropLocation]]]:
+    if mover == YOU:
+        seeds = pits_you[pit_index]
+        if seeds == 0:
+            raise ValueError("illegal move: empty pit")
+        pits_you[pit_index] = 0
+        pos = RING_INDEX_YOU[pit_index]
+    else:
+        seeds = pits_opp[pit_index]
+        if seeds == 0:
+            raise ValueError("illegal move: empty pit")
+        pits_opp[pit_index] = 0
+        pos = RING_INDEX_OPP[pit_index]
+
+    picked_count = seeds
+    drops = [] if record_drops else None
+    last_loc: Optional[DropLocation] = None
+
+    while seeds > 0:
+        pos = (pos + 1) % len(RING)
+        loc = RING[pos]
+        if loc.side == "STORE" and loc.store != mover:
+            continue
+
+        if loc.side == YOU and loc.index is not None:
+            pits_you[loc.index] += 1
+        elif loc.side == OPP and loc.index is not None:
+            pits_opp[loc.index] += 1
+        else:
+            if mover == YOU:
+                store_you += 1
+            else:
+                store_opp += 1
+
+        if record_drops and drops is not None:
+            drops.append(loc)
+        last_loc = loc
+        seeds -= 1
+
+    if last_loc is None:
+        raise ValueError("illegal move: no drops recorded")
+
+    return pits_you, pits_opp, store_you, store_opp, picked_count, last_loc, drops
+
+
+def _apply_move_fast(state: State, pit_num: int) -> tuple[State, bool, bool]:
+    if pit_num < 1 or pit_num > 6:
+        raise ValueError("pit number must be 1..6")
+
+    pits_you = list(state.pits_you)
+    pits_opp = list(state.pits_opp)
+    store_you = state.store_you
+    store_opp = state.store_opp
+    to_move = state.to_move
+
+    i = pit_num - 1
+    extra_turn = False
+    capture = False
+
+    pits_you, pits_opp, store_you, store_opp, _, last_loc, _ = _sow(
+        pits_you, pits_opp, store_you, store_opp, to_move, i, False
+    )
+
+    if to_move == YOU and last_loc.side == YOU and last_loc.index is not None:
+        if pits_you[last_loc.index] == 1:
+            opp_i = 5 - last_loc.index
+            captured = pits_opp[opp_i] + pits_you[last_loc.index]
+            if captured > 0:
+                store_you += captured
+                pits_you[last_loc.index] = 0
+                pits_opp[opp_i] = 0
+                capture = True
+        extra_turn = last_loc.side == "STORE" and last_loc.store == YOU
+    elif to_move == OPP and last_loc.side == OPP and last_loc.index is not None:
+        if pits_opp[last_loc.index] == 1:
+            you_i = 5 - last_loc.index
+            captured = pits_you[you_i] + pits_opp[last_loc.index]
+            if captured > 0:
+                store_opp += captured
+                pits_you[you_i] = 0
+                pits_opp[last_loc.index] = 0
+                capture = True
+        extra_turn = last_loc.side == "STORE" and last_loc.store == OPP
+    else:
+        extra_turn = last_loc.side == "STORE" and last_loc.store == to_move
+
+    if sum(pits_you) == 0 or sum(pits_opp) == 0:
+        if sum(pits_you) == 0:
+            store_opp += sum(pits_opp)
+            pits_opp = [0, 0, 0, 0, 0, 0]
+        if sum(pits_opp) == 0:
+            store_you += sum(pits_you)
+            pits_you = [0, 0, 0, 0, 0, 0]
+
+    next_to_move = to_move if extra_turn else (OPP if to_move == YOU else YOU)
+    new_state = State(next_to_move, tuple(pits_you), tuple(pits_opp), store_you, store_opp)
+    return new_state, extra_turn, capture
 
 
 def _apply_move(state: State, pit_num: int) -> tuple[State, bool, bool, MoveTrace]:
@@ -122,31 +238,13 @@ def _apply_move(state: State, pit_num: int) -> tuple[State, bool, bool, MoveTrac
     extra_turn = False
     capture = False
     capture_info: Optional[CaptureInfo] = None
-    drops: List[DropLocation] = []
 
-    if to_move == YOU:
-        seeds = pits_you[i]
-        if seeds == 0:
-            raise ValueError("illegal move: empty pit")
-        picked_count = seeds
-        pits_you[i] = 0
-        pos = RING_INDEX_YOU[i]
-        while seeds > 0:
-            pos = (pos + 1) % len(RING)
-            loc = RING[pos]
-            if loc.side == "STORE" and loc.store == OPP:
-                continue
-            if loc.side == YOU and loc.index is not None:
-                pits_you[loc.index] += 1
-            elif loc.side == OPP and loc.index is not None:
-                pits_opp[loc.index] += 1
-            elif loc.side == "STORE":
-                store_you += 1
-            drops.append(loc)
-            seeds -= 1
+    pits_you, pits_opp, store_you, store_opp, picked_count, last, drops = _sow(
+        pits_you, pits_opp, store_you, store_opp, to_move, i, True
+    )
 
-        last = drops[-1]
-        if last.side == YOU and last.index is not None and pits_you[last.index] == 1:
+    if to_move == YOU and last.side == YOU and last.index is not None:
+        if pits_you[last.index] == 1:
             opp_i = 5 - last.index
             captured = pits_opp[opp_i] + pits_you[last.index]
             if captured > 0:
@@ -162,31 +260,9 @@ def _apply_move(state: State, pit_num: int) -> tuple[State, bool, bool, MoveTrac
                     captured_count=captured,
                     to_store=YOU,
                 )
-
         extra_turn = last.side == "STORE" and last.store == YOU
-    elif to_move == OPP:
-        seeds = pits_opp[i]
-        if seeds == 0:
-            raise ValueError("illegal move: empty pit")
-        picked_count = seeds
-        pits_opp[i] = 0
-        pos = RING_INDEX_OPP[i]
-        while seeds > 0:
-            pos = (pos + 1) % len(RING)
-            loc = RING[pos]
-            if loc.side == "STORE" and loc.store == YOU:
-                continue
-            if loc.side == YOU and loc.index is not None:
-                pits_you[loc.index] += 1
-            elif loc.side == OPP and loc.index is not None:
-                pits_opp[loc.index] += 1
-            elif loc.side == "STORE":
-                store_opp += 1
-            drops.append(loc)
-            seeds -= 1
-
-        last = drops[-1]
-        if last.side == OPP and last.index is not None and pits_opp[last.index] == 1:
+    elif to_move == OPP and last.side == OPP and last.index is not None:
+        if pits_opp[last.index] == 1:
             you_i = 5 - last.index
             captured = pits_you[you_i] + pits_opp[last.index]
             if captured > 0:
@@ -202,10 +278,9 @@ def _apply_move(state: State, pit_num: int) -> tuple[State, bool, bool, MoveTrac
                     captured_count=captured,
                     to_store=OPP,
                 )
-
         extra_turn = last.side == "STORE" and last.store == OPP
     else:
-        raise ValueError("to_move must be YOU or OPP")
+        extra_turn = last.side == "STORE" and last.store == to_move
 
     if not drops:
         raise ValueError("illegal move: no drops recorded")
