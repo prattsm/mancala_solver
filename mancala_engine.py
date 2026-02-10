@@ -125,7 +125,7 @@ def _sow(
     mover: str,
     pit_index: int,
     record_drops: bool,
-) -> tuple[List[int], List[int], int, int, int, DropLocation, Optional[List[DropLocation]]]:
+) -> tuple[List[int], List[int], int, int, int, int, DropLocation, Optional[List[DropLocation]]]:
     if mover == YOU:
         seeds = pits_you[pit_index]
         if seeds == 0:
@@ -167,7 +167,7 @@ def _sow(
     if last_loc is None:
         raise ValueError("illegal move: no drops recorded")
 
-    return pits_you, pits_opp, store_you, store_opp, picked_count, last_loc, drops
+    return pits_you, pits_opp, store_you, store_opp, picked_count, pos, last_loc, drops
 
 
 def _apply_move_fast(state: State, pit_num: int) -> tuple[State, bool, bool]:
@@ -184,7 +184,7 @@ def _apply_move_fast(state: State, pit_num: int) -> tuple[State, bool, bool]:
     extra_turn = False
     capture = False
 
-    pits_you, pits_opp, store_you, store_opp, _, last_loc, _ = _sow(
+    pits_you, pits_opp, store_you, store_opp, _, _, last_loc, _ = _sow(
         pits_you, pits_opp, store_you, store_opp, to_move, i, False
     )
 
@@ -197,7 +197,6 @@ def _apply_move_fast(state: State, pit_num: int) -> tuple[State, bool, bool]:
                 pits_you[last_loc.index] = 0
                 pits_opp[opp_i] = 0
                 capture = True
-        extra_turn = last_loc.side == "STORE" and last_loc.store == YOU
     elif to_move == OPP and last_loc.side == OPP and last_loc.index is not None:
         if pits_opp[last_loc.index] == 1:
             you_i = 5 - last_loc.index
@@ -207,9 +206,7 @@ def _apply_move_fast(state: State, pit_num: int) -> tuple[State, bool, bool]:
                 pits_you[you_i] = 0
                 pits_opp[last_loc.index] = 0
                 capture = True
-        extra_turn = last_loc.side == "STORE" and last_loc.store == OPP
-    else:
-        extra_turn = last_loc.side == "STORE" and last_loc.store == to_move
+    extra_turn = last_loc.side == "STORE" and last_loc.store == to_move
 
     if sum(pits_you) == 0 or sum(pits_opp) == 0:
         if sum(pits_you) == 0:
@@ -239,7 +236,7 @@ def _apply_move(state: State, pit_num: int) -> tuple[State, bool, bool, MoveTrac
     capture = False
     capture_info: Optional[CaptureInfo] = None
 
-    pits_you, pits_opp, store_you, store_opp, picked_count, last, drops = _sow(
+    pits_you, pits_opp, store_you, store_opp, picked_count, _, last, drops = _sow(
         pits_you, pits_opp, store_you, store_opp, to_move, i, True
     )
 
@@ -260,7 +257,6 @@ def _apply_move(state: State, pit_num: int) -> tuple[State, bool, bool, MoveTrac
                     captured_count=captured,
                     to_store=YOU,
                 )
-        extra_turn = last.side == "STORE" and last.store == YOU
     elif to_move == OPP and last.side == OPP and last.index is not None:
         if pits_opp[last.index] == 1:
             you_i = 5 - last.index
@@ -278,9 +274,7 @@ def _apply_move(state: State, pit_num: int) -> tuple[State, bool, bool, MoveTrac
                     captured_count=captured,
                     to_store=OPP,
                 )
-        extra_turn = last.side == "STORE" and last.store == OPP
-    else:
-        extra_turn = last.side == "STORE" and last.store == to_move
+    extra_turn = last.side == "STORE" and last.store == to_move
 
     if not drops:
         raise ValueError("illegal move: no drops recorded")

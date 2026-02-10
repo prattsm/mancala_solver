@@ -144,10 +144,25 @@ def denormalize_value_flag(value: int, flag: int, sign: int) -> Tuple[int, int]:
     return normalize_value_flag(value, flag, sign)
 
 
+def normalize_move(move: Optional[int], sign: int) -> Optional[int]:
+    """Convert a move into the normalized state's coordinates."""
+    if move is None:
+        return None
+    # Pit numbering is always 1..6 for the side-to-move, so swapping sides
+    # does not change the numeric pit label.
+    return move
+
+
+def denormalize_move(move: Optional[int], sign: int) -> Optional[int]:
+    return normalize_move(move, sign)
+
+
 def _tt_best_move(state: State, tt: Dict[State, TTEntry]) -> Optional[int]:
-    norm_state, _ = normalize_state(state)
+    norm_state, sign = normalize_state(state)
     entry = tt.get(norm_state)
-    return entry.best_move if entry is not None else None
+    if entry is None:
+        return None
+    return denormalize_move(entry.best_move, sign)
 
 
 def ordered_children(state: State, tt: Dict[State, TTEntry]) -> List[Tuple[int, State, bool, bool, int]]:
@@ -158,8 +173,8 @@ def ordered_children(state: State, tt: Dict[State, TTEntry]) -> List[Tuple[int, 
     best_first = _tt_best_move(state, tt)
     children: List[Tuple[int, State, bool, bool, int]] = []
 
+    rest_moves = [move for move in moves if move != best_first]
     if best_first in moves:
-        moves.remove(best_first)
         child_state, extra_turn, capture = apply_move_fast_with_info(state, best_first)
         if state.to_move == YOU:
             store_gain = child_state.store_you - state.store_you
@@ -168,7 +183,7 @@ def ordered_children(state: State, tt: Dict[State, TTEntry]) -> List[Tuple[int, 
         children.append((best_first, child_state, extra_turn, capture, store_gain))
 
     rest: List[Tuple[int, State, bool, bool, int]] = []
-    for move in moves:
+    for move in rest_moves:
         child_state, extra_turn, capture = apply_move_fast_with_info(state, move)
         if state.to_move == YOU:
             store_gain = child_state.store_you - state.store_you
@@ -238,7 +253,8 @@ def search(state: State, alpha: int, beta: int, tt: Dict[State, TTEntry]) -> int
         flag = EXACT
 
     value_norm, flag_norm = normalize_value_flag(best, flag, sign)
-    tt[norm_state] = TTEntry(value_norm, flag_norm, best_move)
+    best_move_norm = normalize_move(best_move, sign)
+    tt[norm_state] = TTEntry(value_norm, flag_norm, best_move_norm)
     return best
 
 
@@ -265,6 +281,8 @@ def best_move(
             if val > best_val:
                 best_val = val
             alpha = max(alpha, best_val)
+            if alpha >= beta:
+                break
     else:
         alpha = -INF
         beta = INF
@@ -275,6 +293,8 @@ def best_move(
             if val < best_val:
                 best_val = val
             beta = min(beta, best_val)
+            if alpha >= beta:
+                break
 
     if state.to_move == YOU:
         scored.sort(key=lambda x: x[1], reverse=True)

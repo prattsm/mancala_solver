@@ -1,6 +1,6 @@
 import unittest
 
-from mancala_engine import OPP, YOU, State, apply_move, apply_move_with_info
+from mancala_engine import OPP, YOU, State, apply_move, apply_move_fast_with_info, apply_move_with_info
 
 
 def make_state(to_move, pits_you, pits_opp, store_you=0, store_opp=0):
@@ -94,6 +94,28 @@ class TestEngine(unittest.TestCase):
         state = make_state(YOU, [0, 0, 0, 0, 0, 0], [1, 1, 1, 1, 1, 1])
         with self.assertRaises(ValueError):
             apply_move(state, 1)
+
+    def test_extra_turn_fast_path(self):
+        state = make_state(YOU, [0, 0, 0, 4, 0, 0], [1, 0, 0, 0, 0, 0])
+        new_state, extra_turn, _ = apply_move_fast_with_info(state, 4)
+        self.assertEqual(new_state.store_you, 1)
+        self.assertEqual(new_state.to_move, YOU)
+        self.assertTrue(extra_turn)
+
+    def test_fast_vs_trace_state_equality(self):
+        states = [
+            make_state(YOU, [4, 4, 4, 4, 4, 4], [4, 4, 4, 4, 4, 4]),
+            make_state(OPP, [0, 1, 0, 5, 2, 0], [3, 0, 4, 0, 1, 6], 2, 1),
+            make_state(YOU, [0, 0, 7, 1, 0, 3], [2, 5, 0, 0, 4, 1], 10, 9),
+        ]
+        for state in states:
+            for move in range(1, 7):
+                pits = state.pits_you if state.to_move == YOU else state.pits_opp
+                if pits[move - 1] == 0:
+                    continue
+                fast_state, _, _ = apply_move_fast_with_info(state, move)
+                trace_state = apply_move_with_info(state, move).state
+                self.assertEqual(fast_state, trace_state)
 
 
 if __name__ == "__main__":
