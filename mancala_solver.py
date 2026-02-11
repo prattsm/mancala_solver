@@ -62,6 +62,7 @@ def default_cache_path() -> Path:
 
 
 def load_tt(path: Path) -> Dict[State, TTEntry]:
+    # Security: pickle is unsafe for untrusted files. Only load caches you trust.
     try:
         with gzip.open(path, "rb") as handle:
             raw = pickle.load(handle)

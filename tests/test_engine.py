@@ -1,6 +1,19 @@
+import random
 import unittest
 
-from mancala_engine import OPP, YOU, State, apply_move, apply_move_fast_with_info, apply_move_with_info
+from mancala_engine import (
+    OPP,
+    YOU,
+    State,
+    apply_move,
+    apply_move_fast,
+    apply_move_fast_with_info,
+    apply_move_with_info,
+    initial_state,
+    is_terminal,
+    legal_moves,
+)
+from mancala_solver import INF, _tt_best_move, ordered_children, search, terminal_diff
 
 
 def make_state(to_move, pits_you, pits_opp, store_you=0, store_opp=0):
@@ -116,6 +129,63 @@ class TestEngine(unittest.TestCase):
                 fast_state, _, _ = apply_move_fast_with_info(state, move)
                 trace_state = apply_move_with_info(state, move).state
                 self.assertEqual(fast_state, trace_state)
+
+    def test_fast_vs_trace_random_reachable_states(self):
+        rng = random.Random(11)
+        state = initial_state(seeds=2, you_first=True)
+        checked = 0
+
+        while checked < 120:
+            if is_terminal(state):
+                state = initial_state(seeds=2, you_first=bool(rng.getrandbits(1)))
+                continue
+
+            moves = legal_moves(state)
+            self.assertTrue(moves)
+            move = rng.choice(moves)
+            fast_state = apply_move_fast(state, move)
+            trace_state = apply_move_with_info(state, move).state
+            self.assertEqual(fast_state, trace_state)
+
+            state = fast_state
+            checked += 1
+
+    def test_tt_best_move_valid_for_opp(self):
+        rng = random.Random(0)
+        tt = {}
+
+        def random_reachable_opp_state():
+            while True:
+                state = initial_state(seeds=2, you_first=bool(rng.getrandbits(1)))
+                plies = rng.randint(1, 18)
+                for _ in range(plies):
+                    if is_terminal(state):
+                        break
+                    move = rng.choice(legal_moves(state))
+                    state = apply_move(state, move)
+                if state.to_move == OPP and not is_terminal(state):
+                    return state
+
+        for _ in range(10):
+            state = random_reachable_opp_state()
+            search(state, -INF, INF, tt)
+            best = _tt_best_move(state, tt)
+            legal = legal_moves(state)
+            if best is not None:
+                self.assertIn(best, legal)
+                apply_move_fast_with_info(state, best)
+            children = ordered_children(state, tt)
+            self.assertTrue(children)
+
+    def test_terminal_diff_virtual_sweep(self):
+        state_you_empty = make_state(YOU, [0, 0, 0, 0, 0, 0], [1, 2, 3, 4, 5, 6], 8, 2)
+        self.assertEqual(terminal_diff(state_you_empty), 8 - (2 + 21))
+
+        state_opp_empty = make_state(OPP, [1, 2, 3, 4, 5, 6], [0, 0, 0, 0, 0, 0], 3, 9)
+        self.assertEqual(terminal_diff(state_opp_empty), (3 + 21) - 9)
+
+        non_terminal = make_state(YOU, [1, 0, 0, 0, 0, 0], [0, 1, 0, 0, 0, 0], 4, 7)
+        self.assertEqual(terminal_diff(non_terminal), -3)
 
 
 if __name__ == "__main__":
