@@ -19,6 +19,8 @@ from mancala_engine import (
 
 INF = 10**9
 CACHE_VERSION = 4
+TT_MAX_ENTRIES = 1_000_000
+TT_PRUNE_TO = 800_000
 
 EXACT = 0
 LOWER = 1
@@ -61,6 +63,23 @@ def default_cache_path() -> Path:
     return Path.home() / ".mancala_cache.pkl.gz"
 
 
+def _tt_get(tt: Dict[State, TTEntry], state: State) -> Optional[TTEntry]:
+    return tt.get(state)
+
+
+def _prune_tt(tt: Dict[State, TTEntry]) -> None:
+    if len(tt) <= TT_MAX_ENTRIES:
+        return
+    while len(tt) > TT_PRUNE_TO:
+        tt.pop(next(iter(tt)))
+
+
+def _tt_store(tt: Dict[State, TTEntry], state: State, entry: TTEntry) -> None:
+    tt[state] = entry
+    if len(tt) > TT_MAX_ENTRIES:
+        _prune_tt(tt)
+
+
 def load_tt(path: Path) -> Dict[State, TTEntry]:
     # Security: pickle is unsafe for untrusted files. Only load caches you trust.
     try:
@@ -94,6 +113,7 @@ def load_tt(path: Path) -> Dict[State, TTEntry]:
         if state is None:
             continue
         tt[state] = TTEntry(value, flag, best_move)
+    _prune_tt(tt)
     return tt
 
 
@@ -160,7 +180,7 @@ def denormalize_move(move: Optional[int], sign: int) -> Optional[int]:
 
 def _tt_best_move(state: State, tt: Dict[State, TTEntry]) -> Optional[int]:
     norm_state, sign = normalize_state(state)
-    entry = tt.get(norm_state)
+    entry = _tt_get(tt, norm_state)
     if entry is None:
         return None
     return denormalize_move(entry.best_move, sign)
@@ -205,7 +225,7 @@ def search(state: State, alpha: int, beta: int, tt: Dict[State, TTEntry]) -> int
 
     alpha0, beta0 = alpha, beta
     norm_state, sign = normalize_state(state)
-    entry = tt.get(norm_state)
+    entry = _tt_get(tt, norm_state)
     if entry is not None:
         value, flag = denormalize_value_flag(entry.value, entry.flag, sign)
         if flag == EXACT:
@@ -255,7 +275,7 @@ def search(state: State, alpha: int, beta: int, tt: Dict[State, TTEntry]) -> int
 
     value_norm, flag_norm = normalize_value_flag(best, flag, sign)
     best_move_norm = normalize_move(best_move, sign)
-    tt[norm_state] = TTEntry(value_norm, flag_norm, best_move_norm)
+    _tt_store(tt, norm_state, TTEntry(value_norm, flag_norm, best_move_norm))
     return best
 
 

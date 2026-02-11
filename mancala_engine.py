@@ -78,6 +78,34 @@ RING: Tuple[DropLocation, ...] = (
 RING_INDEX_YOU = {loc.index: idx for idx, loc in enumerate(RING) if loc.side == YOU}
 RING_INDEX_OPP = {loc.index: idx for idx, loc in enumerate(RING) if loc.side == OPP}
 
+KIND_YOU_PIT = 0
+KIND_OPP_PIT = 1
+KIND_STORE_YOU = 2
+KIND_STORE_OPP = 3
+
+# Integer-encoded ring metadata for the hot sowing path.
+RING_KIND: Tuple[int, ...] = (
+    KIND_YOU_PIT,
+    KIND_YOU_PIT,
+    KIND_YOU_PIT,
+    KIND_YOU_PIT,
+    KIND_YOU_PIT,
+    KIND_YOU_PIT,
+    KIND_STORE_YOU,
+    KIND_OPP_PIT,
+    KIND_OPP_PIT,
+    KIND_OPP_PIT,
+    KIND_OPP_PIT,
+    KIND_OPP_PIT,
+    KIND_OPP_PIT,
+    KIND_STORE_OPP,
+)
+RING_PIT_INDEX: Tuple[int, ...] = (5, 4, 3, 2, 1, 0, -1, 5, 4, 3, 2, 1, 0, -1)
+
+# Precomputed next positions with forbidden store already skipped.
+NEXT_POS_YOU: Tuple[int, ...] = (1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 0, 0)
+NEXT_POS_OPP: Tuple[int, ...] = (1, 2, 3, 4, 5, 7, 7, 8, 9, 10, 11, 12, 13, 0)
+
 
 def initial_state(seeds: int = 4, you_first: bool = True) -> State:
     if seeds < 0:
@@ -132,41 +160,50 @@ def _sow(
             raise ValueError("illegal move: empty pit")
         pits_you[pit_index] = 0
         pos = RING_INDEX_YOU[pit_index]
+        next_pos = NEXT_POS_YOU
     else:
         seeds = pits_opp[pit_index]
         if seeds == 0:
             raise ValueError("illegal move: empty pit")
         pits_opp[pit_index] = 0
         pos = RING_INDEX_OPP[pit_index]
+        next_pos = NEXT_POS_OPP
 
     picked_count = seeds
     drops = [] if record_drops else None
-    last_loc: Optional[DropLocation] = None
+    ring_kind = RING_KIND
+    ring_pit = RING_PIT_INDEX
 
-    while seeds > 0:
-        pos = (pos + 1) % len(RING)
-        loc = RING[pos]
-        if loc.side == "STORE" and loc.store != mover:
-            continue
-
-        if loc.side == YOU and loc.index is not None:
-            pits_you[loc.index] += 1
-        elif loc.side == OPP and loc.index is not None:
-            pits_opp[loc.index] += 1
-        else:
-            if mover == YOU:
+    if drops is None:
+        while seeds > 0:
+            pos = next_pos[pos]
+            kind = ring_kind[pos]
+            if kind == KIND_YOU_PIT:
+                pits_you[ring_pit[pos]] += 1
+            elif kind == KIND_OPP_PIT:
+                pits_opp[ring_pit[pos]] += 1
+            elif kind == KIND_STORE_YOU:
                 store_you += 1
             else:
                 store_opp += 1
+            seeds -= 1
+    else:
+        append_drop = drops.append
+        while seeds > 0:
+            pos = next_pos[pos]
+            kind = ring_kind[pos]
+            if kind == KIND_YOU_PIT:
+                pits_you[ring_pit[pos]] += 1
+            elif kind == KIND_OPP_PIT:
+                pits_opp[ring_pit[pos]] += 1
+            elif kind == KIND_STORE_YOU:
+                store_you += 1
+            else:
+                store_opp += 1
+            append_drop(RING[pos])
+            seeds -= 1
 
-        if record_drops and drops is not None:
-            drops.append(loc)
-        last_loc = loc
-        seeds -= 1
-
-    if last_loc is None:
-        raise ValueError("illegal move: no drops recorded")
-
+    last_loc = RING[pos]
     return pits_you, pits_opp, store_you, store_opp, picked_count, pos, last_loc, drops
 
 

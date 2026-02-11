@@ -3,6 +3,7 @@ import tempfile
 import unittest
 from pathlib import Path
 
+import mancala_solver as solver_mod
 from mancala_engine import (
     DropLocation,
     OPP,
@@ -284,6 +285,29 @@ class TestEngine(unittest.TestCase):
             save_tt(tt, path)
             loaded = load_tt(path)
         self.assertEqual(loaded, tt)
+
+    def test_tt_prunes_when_over_limit(self):
+        original_max = solver_mod.TT_MAX_ENTRIES
+        original_prune_to = solver_mod.TT_PRUNE_TO
+        try:
+            solver_mod.TT_MAX_ENTRIES = 5
+            solver_mod.TT_PRUNE_TO = 3
+            tt = {}
+            states = [
+                make_state(YOU, [1, 1, 1, 1, 1, 1], [1, 1, 1, 1, 1, 1], store_you=i, store_opp=0)
+                for i in range(6)
+            ]
+            for idx, state in enumerate(states):
+                solver_mod._tt_store(tt, state, TTEntry(idx, EXACT, 1))
+
+            self.assertLessEqual(len(tt), 3)
+            self.assertNotIn(states[0], tt)
+            self.assertNotIn(states[1], tt)
+            self.assertNotIn(states[2], tt)
+            self.assertIn(states[-1], tt)
+        finally:
+            solver_mod.TT_MAX_ENTRIES = original_max
+            solver_mod.TT_PRUNE_TO = original_prune_to
 
 
 if __name__ == "__main__":
