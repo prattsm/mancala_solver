@@ -54,7 +54,7 @@ from mancala_engine import (
     is_terminal,
     legal_moves,
 )
-from mancala_solver import best_move, default_cache_path, load_tt, save_tt
+from mancala_solver import SearchResult, default_cache_path, load_tt, save_tt, solve_best_move
 
 
 @dataclass
@@ -85,21 +85,38 @@ class AnimationSettings:
 
 class SolverWorker(QObject):
     result_ready = Signal(int, object)
+    progress = Signal(int, object)
 
     def __init__(self) -> None:
         super().__init__()
         self.tt = {}
         self.tt_lock = threading.Lock()
 
-    @Slot(object, int, int)
-    def solve(self, state: State, topn: int, request_id: int) -> None:
+    @Slot(object, int, int, object)
+    def solve(self, state: State, topn: int, request_id: int, time_limit_ms: Optional[int]) -> None:
         if QThread.currentThread().isInterruptionRequested():
             return
-        with self.tt_lock:
-            move, eval_score, top_moves = best_move(state, topn=topn, tt=self.tt)
+
+        def _on_progress(result: SearchResult) -> None:
+            if QThread.currentThread().isInterruptionRequested():
+                raise InterruptedError()
+            self.progress.emit(request_id, result)
+
+        try:
+            with self.tt_lock:
+                result = solve_best_move(
+                    state,
+                    topn=topn,
+                    tt=self.tt,
+                    time_limit_ms=time_limit_ms,
+                    progress_callback=_on_progress,
+                )
+        except InterruptedError:
+            return
+
         if QThread.currentThread().isInterruptionRequested():
             return
-        self.result_ready.emit(request_id, (move, eval_score, top_moves))
+        self.result_ready.emit(request_id, result)
 
     def set_cache(self, tt) -> None:
         with self.tt_lock:
@@ -161,7 +178,7 @@ class StoreWidget(QFrame):
 
 
 class MancalaWindow(QMainWindow):
-    solve_requested = Signal(object, int, int)
+    solve_requested = Signal(object, int, int, object)
 
     def __init__(self) -> None:
         super().__init__()
@@ -185,11 +202,13 @@ class MancalaWindow(QMainWindow):
 
         self.solve_request_id = 0
         self.solve_target_state: Optional[State] = None
-        self.deferred_result: Optional[Tuple[Optional[int], int, List[Tuple[int, int]]]] = None
+        self.deferred_result: Optional[SearchResult] = None
         self.deferred_result_state: Optional[State] = None
+        self.search_progress: Optional[SearchResult] = None
         self.solving = False
         self.animating = False
         self.closing = False
+        self.solve_time_limit_ms: Optional[int] = 1200
 
         self.anim_counts_you: Optional[List[int]] = None
         self.anim_counts_opp: Optional[List[int]] = None
@@ -364,6 +383,7 @@ class MancalaWindow(QMainWindow):
         self.solver_worker.set_cache(load_tt(self.cache_path))
         self.solver_worker.moveToThread(self.solver_thread)
         self.solve_requested.connect(self.solver_worker.solve)
+        self.solver_worker.progress.connect(self.on_solve_progress)
         self.solver_worker.result_ready.connect(self.on_solve_result)
         self.solver_thread.start()
 
@@ -506,6 +526,7 @@ class MancalaWindow(QMainWindow):
         self.solve_target_state = None
         self.deferred_result = None
         self.deferred_result_state = None
+        self.search_progress = None
         self.solve_request_id += 1
         self.solving = False
         self._clear_anim_counts()
@@ -531,6 +552,7 @@ class MancalaWindow(QMainWindow):
         self.solve_target_state = None
         self.deferred_result = None
         self.deferred_result_state = None
+        self.search_progress = None
         self.solve_request_id += 1
         self.solving = False
         self._clear_anim_counts()
@@ -593,6 +615,7 @@ class MancalaWindow(QMainWindow):
         self.solve_target_state = None
         self.deferred_result = None
         self.deferred_result_state = None
+        self.search_progress = None
         self.solving = False
         self.solve_request_id += 1
 
@@ -613,10 +636,7 @@ class MancalaWindow(QMainWindow):
         self._clear_anim_counts()
         self.animating = False
         if self.deferred_result_state == self.state and self.deferred_result is not None:
-            move, eval_score, top_moves = self.deferred_result
-            self.current_best_move = move
-            self.current_best_eval = eval_score
-            self.current_top_moves = top_moves
+            self._apply_search_result(self.deferred_result)
             self.deferred_result = None
             self.deferred_result_state = None
             self.refresh_ui()
@@ -1109,8 +1129,31 @@ class MancalaWindow(QMainWindow):
         self.solve_target_state = state
         self.deferred_result = None
         self.deferred_result_state = None
+        self.search_progress = None
         self.solving = True
-        self.solve_requested.emit(state, self.topn, self.solve_request_id)
+        self.solve_requested.emit(state, self.topn, self.solve_request_id, self.solve_time_limit_ms)
+
+    def _apply_search_result(self, result: SearchResult) -> None:
+        self.search_progress = result
+        self.current_best_move = result.best_move
+        self.current_best_eval = result.score
+        self.current_top_moves = list(result.top_moves)
+
+    @Slot(int, object)
+    def on_solve_progress(self, request_id: int, result: object) -> None:
+        if self.closing:
+            return
+        if request_id != self.solve_request_id:
+            return
+        if not isinstance(result, SearchResult):
+            return
+        if self.animating:
+            return
+        if self.solve_target_state != self.state:
+            return
+        self._apply_search_result(result)
+        self.update_recommendations()
+        self.update_status()
 
     @Slot(int, object)
     def on_solve_result(self, request_id: int, result: object) -> None:
@@ -1118,19 +1161,18 @@ class MancalaWindow(QMainWindow):
             return
         if request_id != self.solve_request_id:
             return
-        move, eval_score, top_moves = result
+        if not isinstance(result, SearchResult):
+            return
         self.solving = False
         if self.animating and self.pending_state is not None and self.solve_target_state == self.pending_state:
-            self.deferred_result = (move, eval_score, top_moves)
+            self.deferred_result = result
             self.deferred_result_state = self.pending_state
             return
 
         if self.solve_target_state != self.state:
             return
 
-        self.current_best_move = move
-        self.current_best_eval = eval_score
-        self.current_top_moves = top_moves
+        self._apply_search_result(result)
         self.update_recommendations()
         self.update_status()
         self._maybe_autoplay(request_id)
@@ -1261,7 +1303,13 @@ class MancalaWindow(QMainWindow):
             return
 
         if self.solving:
-            self.top_moves_label.setText("Top moves: solving...")
+            if self.search_progress is not None and self.search_progress.best_move is not None:
+                self.top_moves_label.setText(
+                    f"Top moves: depth {self.search_progress.depth} best so far pit "
+                    f"{self.search_progress.best_move} ({self.search_progress.score:+d})"
+                )
+            else:
+                self.top_moves_label.setText("Top moves: solving...")
             self.play_best_button.setEnabled(False)
             return
 
@@ -1309,7 +1357,25 @@ class MancalaWindow(QMainWindow):
         if self.animating:
             status_parts.append("Animating...")
         if self.solving and self.state.to_move == YOU:
-            status_parts.append("Solving...")
+            if self.search_progress is not None and self.search_progress.best_move is not None:
+                elapsed_s = max(0.001, self.search_progress.elapsed_ms / 1000.0)
+                nps = int(self.search_progress.nodes / elapsed_s)
+                status_parts.append(
+                    f"Searching... depth {self.search_progress.depth} (complete depth), "
+                    f"best so far: pit {self.search_progress.best_move} ({self.search_progress.score:+d}), "
+                    f"nodes {self.search_progress.nodes}, nps {nps}"
+                )
+            else:
+                status_parts.append("Solving...")
+        elif (
+            self.state.to_move == YOU
+            and self.search_progress is not None
+            and self.search_progress.complete
+            and self.search_progress.best_move is not None
+        ):
+            status_parts.append(
+                f"Solved (perfect): pit {self.search_progress.best_move} ({self.search_progress.score:+d})"
+            )
         self.status_label.setText(" | ".join(status_parts))
 
     def _format_drop_location(self, drop: DropLocation) -> str:

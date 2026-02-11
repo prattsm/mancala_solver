@@ -27,6 +27,7 @@ from mancala_solver import (
     ordered_children,
     save_tt,
     search,
+    search_depth,
     terminal_diff,
 )
 
@@ -277,8 +278,8 @@ class TestEngine(unittest.TestCase):
         state_a = make_state(YOU, [1, 2, 3, 4, 5, 6], [6, 5, 4, 3, 2, 1], 7, 8)
         state_b = make_state(OPP, [0, 1, 0, 2, 0, 3], [3, 0, 2, 0, 1, 0], 4, 9)
         tt = {
-            state_a: TTEntry(3, EXACT, 4),
-            state_b: TTEntry(-2, EXACT, 1),
+            state_a: TTEntry(3, EXACT, 4, 7),
+            state_b: TTEntry(-2, EXACT, 1, 3),
         }
         with tempfile.TemporaryDirectory() as tmpdir:
             path = Path(tmpdir) / "cache.pkl.gz"
@@ -298,7 +299,7 @@ class TestEngine(unittest.TestCase):
                 for i in range(6)
             ]
             for idx, state in enumerate(states):
-                solver_mod._tt_store(tt, state, TTEntry(idx, EXACT, 1))
+                solver_mod._tt_store(tt, state, TTEntry(idx, EXACT, 1, 1))
 
             self.assertLessEqual(len(tt), 3)
             self.assertNotIn(states[0], tt)
@@ -308,6 +309,15 @@ class TestEngine(unittest.TestCase):
         finally:
             solver_mod.TT_MAX_ENTRIES = original_max
             solver_mod.TT_PRUNE_TO = original_prune_to
+
+    def test_tt_cutoff_requires_sufficient_depth(self):
+        state = make_state(YOU, [2, 2, 0, 0, 0, 0], [2, 2, 0, 0, 0, 0], 0, 0)
+        norm_state, _ = solver_mod.normalize_state(state)
+        tt = {
+            norm_state: TTEntry(123456, EXACT, 1, 1),
+        }
+        value = search_depth(state, depth=2, tt=tt)
+        self.assertNotEqual(value, 123456)
 
 
 if __name__ == "__main__":
