@@ -428,24 +428,40 @@ def _telemetry_maybe_emit_batch(context: _SearchContext, force: bool = False) ->
     stats.last_emit = now
 
 
-def _extract_pv_moves(state: State, tt: Dict[State, TTEntry], max_len: int = 16) -> List[int]:
-    pv: List[int] = []
+def _extract_pv_scored(
+    state: State, tt: Dict[State, TTEntry], max_len: int = 16
+) -> List[Tuple[int, Optional[int], str]]:
+    pv: List[Tuple[int, Optional[int], str]] = []
     seen: set[State] = set()
     current = state
     for _ in range(max_len):
         if current in seen:
             break
         seen.add(current)
-        move = _tt_best_move(current, tt)
+        norm_state, sign = normalize_state(current)
+        entry = _tt_get(tt, norm_state)
+        if entry is None:
+            break
+        move = denormalize_move(entry.best_move, sign)
         if move is None:
             break
         if move not in legal_moves(current):
             break
-        pv.append(move)
+        value, flag = denormalize_value_flag(entry.value, entry.flag, sign)
+        bound = "exact"
+        if flag == LOWER:
+            bound = "lower"
+        elif flag == UPPER:
+            bound = "upper"
+        pv.append((move, value, bound))
         current, _, _ = apply_move_fast_with_info(current, move)
         if is_terminal(current):
             break
     return pv
+
+
+def _extract_pv_moves(state: State, tt: Dict[State, TTEntry], max_len: int = 16) -> List[int]:
+    return [move for move, _, _ in _extract_pv_scored(state, tt, max_len=max_len)]
 
 
 def _decorate_depth_result(
@@ -770,6 +786,7 @@ def solve_best_move(
     def _emit_iteration_done(depth: int, depth_result: _DepthSearchResult, result: SearchResult) -> None:
         if telemetry is None:
             return
+        pv_scored = _extract_pv_scored(state, tt)
         emit_dataclass_event(
             telemetry.sink,
             "iteration_done",
@@ -791,7 +808,8 @@ def solve_best_move(
             "pv_update",
             PVUpdateEvent(
                 depth=depth,
-                pv_moves=_extract_pv_moves(state, tt),
+                pv_moves=[move for move, _, _ in pv_scored],
+                pv_scored=pv_scored,
                 score=depth_result.score,
             ),
         )

@@ -55,6 +55,7 @@ class IterationDoneEvent:
 class PVUpdateEvent:
     depth: int
     pv_moves: list[int]
+    pv_scored: list[tuple[int, Optional[int], str]]
     score: int
 
 

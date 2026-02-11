@@ -42,6 +42,17 @@ class TestTelemetry(unittest.TestCase):
         self.assertIn("node_batch", names)
         self.assertIn("search_end", names)
 
+        pv_events = [event for event in sink.events if event.event == "pv_update"]
+        self.assertTrue(pv_events)
+        latest_pv = pv_events[-1].data
+        self.assertIn("pv_scored", latest_pv)
+        self.assertIsInstance(latest_pv["pv_scored"], list)
+        if latest_pv["pv_scored"]:
+            first = latest_pv["pv_scored"][0]
+            self.assertEqual(len(first), 3)
+            self.assertIsInstance(first[0], int)
+            self.assertIn(first[2], {"exact", "lower", "upper"})
+
     def test_search_end_reason_timeout_on_zero_budget(self):
         sink = _CollectSink()
         state = initial_state(seeds=4, you_first=True)

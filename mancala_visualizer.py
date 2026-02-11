@@ -190,6 +190,7 @@ class VisualizerApp:
         self.asp_retries = 0
         self.max_depth = 0
         self.pv_moves: List[int] = []
+        self.pv_scored: List[Tuple[int, Optional[int], str]] = []
         self.root_scores: Dict[int, int] = {}
         self.depth_hist: Dict[int, int] = {}
         self.cutoff_hist: Dict[int, int] = {}
@@ -301,6 +302,19 @@ class VisualizerApp:
         )
         self.root_scores_label.pack(fill=tk.X, pady=(0, 8))
 
+        self.pv_tree_label = tk.Label(
+            right_top,
+            text="PV tree: -",
+            justify=tk.LEFT,
+            anchor="nw",
+            font=("Courier New", 10),
+            bg="#111820",
+            fg="#d7dde7",
+            padx=8,
+            pady=8,
+        )
+        self.pv_tree_label.pack(fill=tk.X, pady=(0, 8))
+
         self.depth_hist_canvas = tk.Canvas(right_top, width=360, height=140, bg="#10151c", highlightthickness=0)
         self.depth_hist_canvas.pack(fill=tk.X, pady=4)
         self.cutoff_hist_canvas = tk.Canvas(right_top, width=360, height=140, bg="#10151c", highlightthickness=0)
@@ -345,6 +359,7 @@ class VisualizerApp:
                 self.hit_rate_series.clear()
                 self.root_scores.clear()
                 self.pv_moves = []
+                self.pv_scored = []
                 self.search_reason = "-"
             self.state_key = state_key
             parsed = key_to_state(state_key)
@@ -390,6 +405,18 @@ class VisualizerApp:
                     if isinstance(value, int):
                         pv.append(value)
             self.pv_moves = pv
+            scored_raw = data.get("pv_scored")
+            parsed_scored: List[Tuple[int, Optional[int], str]] = []
+            if isinstance(scored_raw, list):
+                for entry in scored_raw:
+                    if isinstance(entry, (list, tuple)) and len(entry) == 3 and isinstance(entry[0], int):
+                        move = entry[0]
+                        score_raw = entry[1]
+                        bound_raw = entry[2]
+                        score = int(score_raw) if isinstance(score_raw, int) else None
+                        bound = str(bound_raw) if isinstance(bound_raw, str) else "exact"
+                        parsed_scored.append((move, score, bound))
+            self.pv_scored = parsed_scored
             return
 
         if event == "node_batch":
@@ -557,6 +584,24 @@ class VisualizerApp:
             else:
                 root_lines.append(f"{marker}pit {pit}: {score:+d}")
         self.root_scores_label.configure(text="\n".join(root_lines))
+
+        pv_tree_lines = ["PV tree (top 3 plies):"]
+        pv_entries = self.pv_scored[:3]
+        if not pv_entries:
+            for idx, move in enumerate(self.pv_moves[:3]):
+                pv_tree_lines.append(f"{'  ' * idx}-> pit {move} (score --)")
+        else:
+            for idx, (move, score, bound) in enumerate(pv_entries):
+                score_text = "--"
+                if score is not None:
+                    if bound == "lower":
+                        score_text = f">={score:+d}"
+                    elif bound == "upper":
+                        score_text = f"<={score:+d}"
+                    else:
+                        score_text = f"{score:+d}"
+                pv_tree_lines.append(f"{'  ' * idx}-> pit {move} (score {score_text})")
+        self.pv_tree_label.configure(text="\n".join(pv_tree_lines))
 
         self._draw_series(self.nodes_canvas, self.nodes_series, "Nodes vs Time", "#4fc3f7")
         self._draw_series(self.nps_canvas, self.nps_series, "NPS vs Time", "#81c784")
