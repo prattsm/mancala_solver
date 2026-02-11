@@ -19,7 +19,7 @@ from mancala_engine import (
     legal_moves,
     pretty_print,
 )
-from mancala_solver import best_move, default_cache_path, load_tt, save_tt
+from mancala_solver import default_cache_path, load_tt, save_tt, solve_best_move
 
 
 def prompt_yes_no(prompt: str) -> bool:
@@ -48,8 +48,11 @@ def read_move(prompt: str, allow_enter: bool, default_move: Optional[int]) -> st
         except EOFError:
             print()
             return "q"
-        if raw == "" and allow_enter:
-            return "" if default_move is not None else ""
+        if raw == "":
+            if allow_enter and default_move is not None:
+                return ""
+            print("Please enter a pit number 1-6, or a command.")
+            continue
         return raw
 
 
@@ -58,6 +61,17 @@ def main(argv: Optional[List[str]] = None) -> int:
     parser.add_argument("--seeds", type=int, default=4, help="starting seeds per pit (default: 4)")
     parser.add_argument("--topn", type=int, default=3, help="show top N moves (default: 3)")
     parser.add_argument("--explain", action="store_true", help="print evals for top moves")
+    parser.add_argument(
+        "--time-ms",
+        type=int,
+        default=300,
+        help="search budget per recommendation in milliseconds (default: 300)",
+    )
+    parser.add_argument(
+        "--perfect",
+        action="store_true",
+        help="search to terminal (ignores --time-ms)",
+    )
     args = parser.parse_args(argv)
 
     if args.seeds < 0:
@@ -83,20 +97,41 @@ def main(argv: Optional[List[str]] = None) -> int:
             )
             return 0
 
+        recommended_move: Optional[int] = None
         if state.to_move == YOU:
-            move, eval_score, top = best_move(state, topn=args.topn, tt=tt)
-            if move is None:
+            time_limit_ms: Optional[int]
+            if args.perfect or args.time_ms <= 0:
+                time_limit_ms = None
+            else:
+                time_limit_ms = args.time_ms
+            result = solve_best_move(state, topn=args.topn, tt=tt, time_limit_ms=time_limit_ms)
+            recommended_move = result.best_move
+            if recommended_move is None:
                 print("No legal moves.")
                 return 0
 
+            status = "perfect" if result.complete else "best so far"
             print()
-            print(f"Recommended: pit {move} (eval: {eval_score:+d})")
-            if args.explain and top:
-                top_str = ", ".join(f"{m}:{e:+d}" for m, e in top)
+            print(f"Recommended: pit {recommended_move} (score: {result.score:+d}, {status})")
+            if args.explain and result.top_moves:
+                top_str = ", ".join(f"{m}:{e:+d}" for m, e in result.top_moves)
                 print(f"Top: {top_str}")
+                print(
+                    f"Search: depth={result.depth} complete={result.complete} "
+                    f"elapsed_ms={result.elapsed_ms} nodes={result.nodes}"
+                )
+            elif args.explain:
+                print(
+                    f"Search: depth={result.depth} complete={result.complete} "
+                    f"elapsed_ms={result.elapsed_ms} nodes={result.nodes}"
+                )
 
             print("You: choose pit 1..6 (pit 1 is closest to your store).")
-            raw = read_move("Your move (1-6, Enter=best, q=quit, u=undo, h=help): ", True, move)
+            raw = read_move(
+                "Your move (1-6, Enter=best, q=quit, u=undo, h=help): ",
+                True,
+                recommended_move,
+            )
         else:
             print("Opponent: enter pit 1..6 (pit 1 is closest to their store).")
             raw = read_move("Opponent move (1-6, q=quit, u=undo, h=help): ", False, None)
@@ -114,7 +149,10 @@ def main(argv: Optional[List[str]] = None) -> int:
             continue
 
         if raw == "":
-            chosen = move
+            if recommended_move is None:
+                print("Enter is only available on your turn when a recommendation is shown.")
+                continue
+            chosen = recommended_move
         else:
             if not raw.isdigit():
                 print("Please enter a pit number 1-6, or a command.")

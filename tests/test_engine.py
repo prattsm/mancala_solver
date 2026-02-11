@@ -280,7 +280,7 @@ class TestEngine(unittest.TestCase):
         state_b = make_state(OPP, [0, 1, 0, 2, 0, 3], [3, 0, 2, 0, 1, 0], 4, 9)
         tt = {
             state_a: TTEntry(3, EXACT, 4, 7),
-            state_b: TTEntry(-2, EXACT, 1, 3),
+            state_b: TTEntry(-2, EXACT, 1, 3, True),
         }
         with tempfile.TemporaryDirectory() as tmpdir:
             path = Path(tmpdir) / "cache.pkl.gz"
@@ -374,6 +374,49 @@ class TestEngine(unittest.TestCase):
         self.assertEqual(result.score, 3)
         self.assertFalse(result.complete)
         self.assertEqual(result.top_moves[:1], [(4, 3)])
+
+    def test_unproven_tt_exact_does_not_mark_complete(self):
+        state = initial_state(seeds=4, you_first=True)
+        tt = {}
+        for move in legal_moves(state):
+            child_state, _, _ = apply_move_fast_with_info(state, move)
+            solver_mod.search_depth(child_state, depth=1, tt=tt)
+        result = solve_best_move(state, topn=3, tt=tt, time_limit_ms=200, start_depth=2)
+        self.assertFalse(result.complete)
+
+    def test_root_aspiration_researches_bound_scores(self):
+        state = initial_state(seeds=1, you_first=True)
+        child_a = make_state(YOU, [1, 0, 0, 0, 0, 0], [0, 0, 0, 0, 0, 0])
+        child_b = make_state(YOU, [0, 1, 0, 0, 0, 0], [0, 0, 0, 0, 0, 0])
+        fake_children = [
+            (1, child_a, False, False, 0),
+            (2, child_b, False, False, 0),
+        ]
+        context = solver_mod._SearchContext(tt={}, deadline=None)
+        original_children = solver_mod.ordered_children
+        original_search = solver_mod._search_depth
+        calls = []
+
+        def fake_ordered_children(_state, _tt):
+            return fake_children
+
+        def fake_search(child_state, alpha, beta, depth, _context):
+            calls.append((child_state, alpha, beta))
+            if alpha == -solver_mod.INF and beta == solver_mod.INF:
+                return (50 if child_state is child_a else 10, False)
+            return (beta if child_state is child_a else alpha, False)
+
+        try:
+            solver_mod.ordered_children = fake_ordered_children
+            solver_mod._search_depth = fake_search
+            result = solver_mod._best_move_depth(state, topn=2, depth=3, context=context, alpha=-5, beta=5)
+        finally:
+            solver_mod.ordered_children = original_children
+            solver_mod._search_depth = original_search
+
+        self.assertEqual(result.best_move, 1)
+        self.assertEqual(result.score, 50)
+        self.assertIn((child_a, -solver_mod.INF, solver_mod.INF), calls)
 
 
 if __name__ == "__main__":

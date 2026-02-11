@@ -20,7 +20,7 @@ from mancala_engine import (
 
 INF = 10**9
 FULL_DEPTH = 1_000_000
-CACHE_VERSION = 5
+CACHE_VERSION = 6
 TT_MAX_ENTRIES = 1_000_000
 TT_PRUNE_TO = 800_000
 ASPIRATION_WINDOW_INIT = 4
@@ -40,6 +40,7 @@ class TTEntry:
     flag: int
     best_move: Optional[int]
     depth: int
+    proven: bool = False
 
 
 @dataclass(frozen=True)
@@ -123,6 +124,14 @@ def _tt_store(tt: Dict[State, TTEntry], state: State, entry: TTEntry) -> None:
             return
         if existing.depth == entry.depth and existing.flag == EXACT and entry.flag != EXACT:
             return
+        if (
+            existing.depth == entry.depth
+            and existing.flag == EXACT
+            and entry.flag == EXACT
+            and existing.proven
+            and not entry.proven
+        ):
+            return
     tt[state] = entry
     if len(tt) > TT_MAX_ENTRIES:
         _prune_tt(tt)
@@ -148,9 +157,13 @@ def load_tt(path: Path) -> Dict[State, TTEntry]:
     for key, entry in raw_tt.items():
         if not isinstance(key, str):
             continue
-        if not isinstance(entry, tuple) or len(entry) != 4:
+        if not isinstance(entry, tuple) or len(entry) not in {4, 5}:
             continue
-        value, flag, best_move, depth = entry
+        if len(entry) == 4:
+            value, flag, best_move, depth = entry
+            proven = False
+        else:
+            value, flag, best_move, depth, proven = entry
         if not isinstance(value, int):
             continue
         if flag not in {EXACT, LOWER, UPPER}:
@@ -159,10 +172,12 @@ def load_tt(path: Path) -> Dict[State, TTEntry]:
             continue
         if not isinstance(depth, int) or depth < 0:
             continue
+        if not isinstance(proven, bool):
+            continue
         state = key_to_state(key)
         if state is None:
             continue
-        tt[state] = TTEntry(value, flag, best_move, depth)
+        tt[state] = TTEntry(value, flag, best_move, depth, proven)
     _prune_tt(tt)
     return tt
 
@@ -173,7 +188,7 @@ def save_tt(tt: Dict[State, TTEntry], path: Path) -> None:
         data = {
             "version": CACHE_VERSION,
             "tt": {
-                state_key(state): (entry.value, entry.flag, entry.best_move, entry.depth)
+                state_key(state): (entry.value, entry.flag, entry.best_move, entry.depth, entry.proven)
                 for state, entry in tt.items()
             },
         }
@@ -286,18 +301,20 @@ def _check_deadline(context: _SearchContext) -> None:
         raise SearchTimeout()
 
 
-def _search_depth(state: State, alpha: int, beta: int, depth: int, context: _SearchContext) -> int:
+def _search_depth(
+    state: State, alpha: int, beta: int, depth: int, context: _SearchContext
+) -> Tuple[int, bool]:
     _check_deadline(context)
     context.nodes += 1
     if context.live_nodes_callback is not None and (context.nodes & LIVE_POLL_MASK) == 0:
         context.live_nodes_callback(context.nodes)
 
     if is_terminal(state):
-        return terminal_diff(state)
+        return terminal_diff(state), True
 
     if depth <= 0:
         context.hit_depth_limit = True
-        return _heuristic_eval(state)
+        return _heuristic_eval(state), False
 
     alpha0, beta0 = alpha, beta
     norm_state, sign = normalize_state(state)
@@ -305,36 +322,41 @@ def _search_depth(state: State, alpha: int, beta: int, depth: int, context: _Sea
     if entry is not None and entry.depth >= depth:
         value, flag = denormalize_value_flag(entry.value, entry.flag, sign)
         if flag == EXACT:
-            return value
+            if not entry.proven:
+                context.hit_depth_limit = True
+            return value, entry.proven
         if flag == LOWER:
             alpha = max(alpha, value)
         elif flag == UPPER:
             beta = min(beta, value)
         if alpha >= beta:
-            return value
+            return value, False
 
     children = ordered_children(state, context.tt)
     if not children:
-        return terminal_diff(state)
+        return terminal_diff(state), True
 
     best_move: Optional[int] = None
+    best_proven = False
     if state.to_move == YOU:
         best = -INF
         for move, child_state, _, _, _ in children:
-            val = _search_depth(child_state, alpha, beta, depth - 1, context)
-            if val > best:
+            val, val_proven = _search_depth(child_state, alpha, beta, depth - 1, context)
+            if val > best or (val == best and val_proven and not best_proven):
                 best = val
                 best_move = move
+                best_proven = val_proven
             alpha = max(alpha, best)
             if alpha >= beta:
                 break
     else:
         best = INF
         for move, child_state, _, _, _ in children:
-            val = _search_depth(child_state, alpha, beta, depth - 1, context)
-            if val < best:
+            val, val_proven = _search_depth(child_state, alpha, beta, depth - 1, context)
+            if val < best or (val == best and val_proven and not best_proven):
                 best = val
                 best_move = move
+                best_proven = val_proven
             beta = min(beta, best)
             if alpha >= beta:
                 break
@@ -351,8 +373,9 @@ def _search_depth(state: State, alpha: int, beta: int, depth: int, context: _Sea
 
     value_norm, flag_norm = normalize_value_flag(best, flag, sign)
     best_move_norm = normalize_move(best_move, sign)
-    _tt_store(context.tt, norm_state, TTEntry(value_norm, flag_norm, best_move_norm, depth))
-    return best
+    exact_proven = best_proven if flag == EXACT else False
+    _tt_store(context.tt, norm_state, TTEntry(value_norm, flag_norm, best_move_norm, depth, exact_proven))
+    return best, exact_proven
 
 
 def search_depth(
@@ -363,7 +386,7 @@ def search_depth(
     beta: int = INF,
 ) -> int:
     context = _SearchContext(tt=tt, deadline=None, interrupt_check=None)
-    return _search_depth(state, alpha, beta, max(0, depth), context)
+    return _search_depth(state, alpha, beta, max(0, depth), context)[0]
 
 
 def search(state: State, alpha: int, beta: int, tt: Dict[State, TTEntry]) -> int:
@@ -390,15 +413,29 @@ def _best_move_depth(
         )
 
     scored: List[Tuple[int, int]] = []
+    alpha_root = alpha
+    beta_root = beta
     if state.to_move == YOU:
         for move, child_state, _, _, _ in children:
-            val = _search_depth(child_state, alpha, beta, depth - 1, context)
+            move_alpha = alpha_root
+            move_beta = beta_root
+            val, _ = _search_depth(child_state, move_alpha, move_beta, depth - 1, context)
+            if val <= move_alpha or val >= move_beta:
+                # Move result is a bound in this aspiration window; re-search for an exact score.
+                val, _ = _search_depth(child_state, -INF, INF, depth - 1, context)
             scored.append((move, val))
+            alpha_root = max(alpha_root, val)
         scored.sort(key=lambda item: item[1], reverse=True)
     else:
         for move, child_state, _, _, _ in children:
-            val = _search_depth(child_state, alpha, beta, depth - 1, context)
+            move_alpha = alpha_root
+            move_beta = beta_root
+            val, _ = _search_depth(child_state, move_alpha, move_beta, depth - 1, context)
+            if val <= move_alpha or val >= move_beta:
+                # Move result is a bound in this aspiration window; re-search for an exact score.
+                val, _ = _search_depth(child_state, -INF, INF, depth - 1, context)
             scored.append((move, val))
+            beta_root = min(beta_root, val)
         scored.sort(key=lambda item: item[1])
 
     topn = max(0, topn)

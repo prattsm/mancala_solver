@@ -1,6 +1,6 @@
 # GamePigeon Mancala (Capture Mode) Solver
 
-CLI and desktop GUI that recommend the best move for GamePigeon Mancala in Capture mode (Kalah rules). It assumes optimal play from both sides and searches to terminal states with minimax + alpha-beta.
+CLI and desktop GUI that recommend the best move for GamePigeon Mancala in Capture mode (Kalah rules). It assumes optimal play from both sides and uses minimax + alpha-beta with iterative deepening.
 
 ## Setup
 - Python 3.9+ recommended
@@ -16,6 +16,8 @@ Optional flags:
 - `--seeds N` starting seeds per pit (default 4)
 - `--topn K` number of top moves to list (default 3)
 - `--explain` show evals for top moves
+- `--time-ms N` per-turn search budget in milliseconds (default 300)
+- `--perfect` search to terminal (ignores `--time-ms`)
 
 ## Run (GUI)
 ```bash
@@ -31,8 +33,9 @@ python3 -m unittest discover -s tests
 - At startup, choose whether you go first.
 - On your turn, the tool prints a recommended move (pit 1 is closest to your store) and optional top moves.
 - Enter a pit number `1-6` to play, or press Enter to accept the recommendation.
-- On opponent turns, enter the pit number they played.
+- On opponent turns, enter the pit number they played. Pressing Enter on opponent turns re-prompts.
 - Commands: `u` undo, `h` help, `q` quit.
+- With `--explain`, CLI prints search depth, `complete` flag, elapsed milliseconds, and visited nodes for each recommendation.
 
 ## User Guide (GUI)
 - Pick turn order and seed count, then click `Reset` to start a new game.
@@ -47,5 +50,6 @@ python3 -m unittest discover -s tests
 ## Notes
 - Board display shows opponent pits left-to-right as `1..6` and your pits left-to-right as `6..1`.
 - Evaluation is `your_store - opponent_store` at terminal.
+- CLI and GUI both use timed iterative deepening by default and report best-so-far until a position is proven perfect.
 - GUI search uses iterative deepening with a time budget and reports the best completed depth so far.
 - The solver cache is stored at `~/.mancala_cache.pkl.gz` and reused across sessions.
