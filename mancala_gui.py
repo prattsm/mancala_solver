@@ -22,6 +22,7 @@ from PySide6.QtCore import (
     QThread,
     Signal,
     Slot,
+    QSettings,
     QTimer,
 )
 from PySide6.QtGui import QFont
@@ -61,6 +62,8 @@ from mancala_solver import SearchResult, default_cache_path, load_tt, save_tt, s
 
 SOLVE_SLICE_MS = 300
 SOLVE_REQUEUE_DELAY_MS = 50
+SETTINGS_ORG = "prattsm"
+SETTINGS_APP = "mancala_solver"
 
 
 @dataclass
@@ -225,6 +228,7 @@ class MancalaWindow(QMainWindow):
         self.setMinimumSize(900, 720)
 
         self.cache_path: Path = default_cache_path()
+        self.settings = QSettings(SETTINGS_ORG, SETTINGS_APP)
 
         self.state: State = initial_state(seeds=4, you_first=True)
         self.history: List[HistoryEntry] = []
@@ -279,6 +283,7 @@ class MancalaWindow(QMainWindow):
         self.slice_progress_timer.setInterval(200)
         self.slice_progress_timer.timeout.connect(self._update_slice_progress_bar)
         self._apply_style()
+        self._load_persistent_settings()
 
         self.reset_game()
 
@@ -1544,6 +1549,48 @@ class MancalaWindow(QMainWindow):
             self.anim_panel.setVisible(checked)
         self.anim_toggle.setArrowType(Qt.DownArrow if checked else Qt.RightArrow)
 
+    @staticmethod
+    def _to_bool(value: object, default: bool) -> bool:
+        if isinstance(value, bool):
+            return value
+        if isinstance(value, int):
+            return value != 0
+        if isinstance(value, str):
+            lowered = value.strip().lower()
+            if lowered in {"1", "true", "yes", "on"}:
+                return True
+            if lowered in {"0", "false", "no", "off"}:
+                return False
+        return default
+
+    def _load_persistent_settings(self) -> None:
+        geometry = self.settings.value("window/geometry")
+        if geometry is not None:
+            self.restoreGeometry(geometry)
+
+        expanded = self._to_bool(
+            self.settings.value("view/animation_expanded"),
+            self.anim_toggle.isChecked(),
+        )
+        self.anim_toggle.setChecked(expanded)
+
+        show_numbers = self._to_bool(
+            self.settings.value("view/show_pit_numbers"),
+            self.show_numbers_check.isChecked(),
+        )
+        self.show_numbers_check.setChecked(show_numbers)
+
+        speed = self.settings.value("animation/speed")
+        if isinstance(speed, str) and self.speed_combo.findText(speed) >= 0:
+            self.speed_combo.setCurrentText(speed)
+
+    def _save_persistent_settings(self) -> None:
+        self.settings.setValue("window/geometry", self.saveGeometry())
+        self.settings.setValue("view/animation_expanded", self.anim_toggle.isChecked())
+        self.settings.setValue("view/show_pit_numbers", self.show_numbers_check.isChecked())
+        self.settings.setValue("animation/speed", self.speed_combo.currentText())
+        self.settings.sync()
+
     def _maybe_autoplay(self, expected_request: int) -> None:
         if (
             self.auto_play_check.isChecked()
@@ -1716,6 +1763,7 @@ class MancalaWindow(QMainWindow):
         self.closing = True
         self.solving = False
         self.requeue_pending = False
+        self._save_persistent_settings()
         self.solve_request_id += 1
         self._set_latest_request_id()
         self.slice_progress_timer.stop()

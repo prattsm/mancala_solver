@@ -29,6 +29,11 @@ python3 mancala_gui.py
 python3 -m unittest discover -s tests
 ```
 
+GUI integration tests use PySide6 and run headless with:
+```bash
+QT_QPA_PLATFORM=offscreen python3 -m unittest discover -s tests
+```
+
 ## User Guide (CLI)
 - At startup, choose whether you go first.
 - On your turn, the tool prints a recommended move (pit 1 is closest to your store) and optional top moves.
@@ -43,6 +48,7 @@ python3 -m unittest discover -s tests
 - If it is the opponent’s turn, click the pit they played on their side.
 - Use `Undo` to revert one move. Enable auto-play to let the solver play your turns.
 - Use the animation controls to adjust speed or replay the last move.
+- Window size, animation panel state, animation speed, and pit-number visibility persist across sessions.
 - While solving, the status line shows iterative-deepening progress with a provisional best move.
 - When the solver fully proves the position, the status line shows `Solved (perfect)`.
 - GUI continues timed deepening passes in the background until a perfect result is proven.

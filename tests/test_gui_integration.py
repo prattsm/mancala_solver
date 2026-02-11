@@ -1,0 +1,245 @@
+import tempfile
+import unittest
+from unittest.mock import patch
+
+try:
+    from PySide6.QtCore import QSettings
+    from PySide6.QtGui import QCloseEvent
+    from PySide6.QtTest import QSignalSpy
+    from PySide6.QtWidgets import QApplication
+
+    import mancala_gui as gui_mod
+    from mancala_engine import YOU, apply_move_with_info
+    from mancala_solver import SearchResult
+
+    HAS_QT = True
+except Exception:
+    HAS_QT = False
+
+
+if HAS_QT:
+    class _DummyThread:
+        def __init__(self) -> None:
+            self.wait_results = [True]
+            self.wait_calls = []
+            self.requested_interruption = False
+            self.quit_called = False
+            self.terminate_called = False
+
+        def requestInterruption(self) -> None:
+            self.requested_interruption = True
+
+        def isInterruptionRequested(self) -> bool:
+            return self.requested_interruption
+
+        def quit(self) -> None:
+            self.quit_called = True
+
+        def wait(self, timeout: int) -> bool:
+            self.wait_calls.append(timeout)
+            if self.wait_results:
+                return self.wait_results.pop(0)
+            return True
+
+        def terminate(self) -> None:
+            self.terminate_called = True
+
+
+    class _DummyWorker:
+        def __init__(self) -> None:
+            self.latest_request_id = 0
+            self.cache = {}
+            self.solve_calls = []
+
+        def set_latest_request_id(self, request_id: int) -> None:
+            self.latest_request_id = request_id
+
+        def solve(self, *args) -> None:
+            self.solve_calls.append(args)
+
+        def set_cache(self, tt) -> None:
+            self.cache = dict(tt)
+
+        def snapshot_cache(self) -> dict:
+            return dict(self.cache)
+
+        def try_snapshot_cache(self):
+            return dict(self.cache)
+
+
+    def _fake_setup_solver(window: "gui_mod.MancalaWindow") -> None:
+        window.solver_thread = _DummyThread()
+        window.solver_worker = _DummyWorker()
+        window.solver_worker.set_latest_request_id(window.solve_request_id)
+        window.solve_requested.connect(window.solver_worker.solve)
+
+
+@unittest.skipUnless(HAS_QT, "PySide6 is required for GUI integration tests")
+class TestGUIIntegration(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls) -> None:
+        cls.app = QApplication.instance() or QApplication([])
+
+    def setUp(self) -> None:
+        self.slice_patch = patch.object(gui_mod, "SOLVE_SLICE_MS", 40)
+        self.requeue_patch = patch.object(gui_mod, "SOLVE_REQUEUE_DELAY_MS", 1)
+        self.setup_patch = patch.object(gui_mod.MancalaWindow, "_setup_solver", _fake_setup_solver)
+        self.save_patch = patch.object(gui_mod, "save_tt")
+        self.slice_patch.start()
+        self.requeue_patch.start()
+        self.setup_patch.start()
+        self.save_tt_mock = self.save_patch.start()
+
+        self.window = gui_mod.MancalaWindow()
+        self.window.slice_progress_timer.stop()
+        self.window.slice_start_time = None
+        self.window.solving = False
+        self.window.requeue_pending = False
+        self.window.search_progress = None
+        self.window.current_best_move = None
+        self.window.current_top_moves = []
+
+    def tearDown(self) -> None:
+        if self.window is not None:
+            self.window.close()
+            self.app.processEvents()
+        self.save_patch.stop()
+        self.setup_patch.stop()
+        self.requeue_patch.stop()
+        self.slice_patch.stop()
+
+    def _prepare_pending_extra_turn(self):
+        prev_state = self.window.state
+        info = apply_move_with_info(prev_state, 4)
+        self.assertEqual(info.state.to_move, YOU)
+        pre_counts = gui_mod.CountsSnapshot(
+            pits_you=tuple(prev_state.pits_you),
+            pits_opp=tuple(prev_state.pits_opp),
+            store_you=prev_state.store_you,
+            store_opp=prev_state.store_opp,
+        )
+        self.window.pending_state = info.state
+        self.window.pending_trace = info.trace
+        self.window.pending_pre_counts = pre_counts
+        return info.state
+
+    def test_deferred_incomplete_result_requeues_after_commit(self) -> None:
+        committed_state = self._prepare_pending_extra_turn()
+        deferred = SearchResult(
+            best_move=4,
+            score=3,
+            top_moves=[(4, 3)],
+            depth=5,
+            complete=False,
+            elapsed_ms=10,
+            nodes=100,
+        )
+        self.window.deferred_result = deferred
+        self.window.deferred_result_state = committed_state
+        self.window.solve_target_state = committed_state
+
+        spy = QSignalSpy(self.window.solve_requested)
+        self.window.commit_pending_move()
+
+        self.assertTrue(spy.wait(1000))
+        self.assertIsNotNone(self.window.search_progress)
+        self.assertEqual(self.window.search_progress.depth, 5)
+        self.assertFalse(self.window.search_progress.complete)
+
+    def test_incomplete_result_requeues_from_on_solve_result(self) -> None:
+        result = SearchResult(
+            best_move=4,
+            score=1,
+            top_moves=[(4, 1), (3, 0)],
+            depth=2,
+            complete=False,
+            elapsed_ms=8,
+            nodes=64,
+        )
+        self.window.solve_target_state = self.window.state
+        self.window.solving = True
+        request_id = self.window.solve_request_id
+        spy = QSignalSpy(self.window.solve_requested)
+
+        self.window.on_solve_result(request_id, result)
+
+        self.assertTrue(spy.wait(1000))
+        self.assertIsNotNone(self.window.search_progress)
+        self.assertEqual(self.window.search_progress.depth, 2)
+        self.assertFalse(self.window.search_progress.complete)
+
+    def test_close_event_uses_bounded_wait_and_terminate_fallback(self) -> None:
+        self.window.solver_thread.wait_results = [False, True]
+        event = QCloseEvent()
+
+        self.window.closeEvent(event)
+
+        self.assertEqual(self.window.solver_thread.wait_calls, [3000, 500])
+        self.assertTrue(self.window.solver_thread.terminate_called)
+        self.save_tt_mock.assert_called_once()
+        self.window = None
+
+
+@unittest.skipUnless(HAS_QT, "PySide6 is required for GUI integration tests")
+class TestGUISettingsPersistence(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls) -> None:
+        cls.app = QApplication.instance() or QApplication([])
+
+    def setUp(self) -> None:
+        self.temp_dir = tempfile.TemporaryDirectory()
+        self.prev_format = QSettings.defaultFormat()
+        QSettings.setDefaultFormat(QSettings.IniFormat)
+        QSettings.setPath(QSettings.IniFormat, QSettings.UserScope, self.temp_dir.name)
+
+        self.org_patch = patch.object(gui_mod, "SETTINGS_ORG", "mancala_test_org")
+        self.app_patch = patch.object(gui_mod, "SETTINGS_APP", "mancala_test_app")
+        self.setup_patch = patch.object(gui_mod.MancalaWindow, "_setup_solver", _fake_setup_solver)
+        self.save_patch = patch.object(gui_mod, "save_tt")
+        self.org_patch.start()
+        self.app_patch.start()
+        self.setup_patch.start()
+        self.save_patch.start()
+
+        self.window = gui_mod.MancalaWindow()
+        self.window.slice_progress_timer.stop()
+        self.window.solving = False
+
+    def tearDown(self) -> None:
+        if self.window is not None:
+            self.window.close()
+            self.app.processEvents()
+        self.save_patch.stop()
+        self.setup_patch.stop()
+        self.app_patch.stop()
+        self.org_patch.stop()
+        QSettings.setDefaultFormat(self.prev_format)
+        self.temp_dir.cleanup()
+
+    def test_view_settings_persist_across_windows(self) -> None:
+        self.window.resize(1060, 760)
+        self.window.anim_toggle.setChecked(True)
+        self.window.show_numbers_check.setChecked(True)
+        self.window.speed_combo.setCurrentText("Slow")
+        self.window._save_persistent_settings()
+        self.window.close()
+        self.window = None
+
+        restored = gui_mod.MancalaWindow()
+        restored.slice_progress_timer.stop()
+
+        self.assertTrue(restored.anim_toggle.isChecked())
+        self.assertTrue(restored.show_numbers_check.isChecked())
+        self.assertEqual(restored.speed_combo.currentText(), "Slow")
+
+        settings = QSettings(gui_mod.SETTINGS_ORG, gui_mod.SETTINGS_APP)
+        self.assertIsNotNone(settings.value("window/geometry"))
+        self.assertGreaterEqual(restored.width(), 900)
+        self.assertGreaterEqual(restored.height(), 720)
+
+        restored.close()
+        self.window = None
+
+
+if __name__ == "__main__":
+    unittest.main()
