@@ -62,6 +62,7 @@ class _SearchContext:
     live_nodes_callback: Optional[Callable[[int], None]] = None
     nodes: int = 0
     hit_depth_limit: bool = False
+    used_unproven_tt: bool = False
 
 
 @dataclass(frozen=True)
@@ -142,7 +143,7 @@ def load_tt(path: Path) -> Dict[State, TTEntry]:
     try:
         with gzip.open(path, "rb") as handle:
             raw = pickle.load(handle)
-    except (OSError, pickle.PickleError, EOFError):
+    except Exception:
         return {}
 
     if not isinstance(raw, dict):
@@ -321,6 +322,8 @@ def _search_depth(
     entry = _tt_get(context.tt, norm_state)
     if entry is not None and entry.depth >= depth:
         value, flag = denormalize_value_flag(entry.value, entry.flag, sign)
+        if not entry.proven:
+            context.used_unproven_tt = True
         if flag == EXACT:
             if not entry.proven:
                 context.hit_depth_limit = True
@@ -538,14 +541,31 @@ def solve_best_move(
             interrupt_check=interrupt_check,
             live_nodes_callback=_emit_live,
         )
-        depth_result = _best_move_depth(state, topn, FULL_DEPTH, context, -INF, INF)
+        try:
+            depth_result = _best_move_depth(state, topn, FULL_DEPTH, context, -INF, INF)
+        except SearchTimeout:
+            move, score, top_moves = _fallback_best_move(state, topn)
+            elapsed_ms = int((time.perf_counter() - start) * 1000)
+            result = SearchResult(
+                best_move=move,
+                score=score,
+                top_moves=top_moves,
+                depth=0,
+                complete=False,
+                elapsed_ms=elapsed_ms,
+                nodes=context.nodes,
+            )
+            _emit_live(result.nodes)
+            if progress_callback is not None:
+                progress_callback(result)
+            return result
         elapsed_ms = int((time.perf_counter() - start) * 1000)
         result = SearchResult(
             best_move=depth_result.best_move,
             score=depth_result.score,
             top_moves=depth_result.top_moves,
             depth=0,
-            complete=True,
+            complete=(not context.hit_depth_limit and not context.used_unproven_tt),
             elapsed_ms=elapsed_ms,
             nodes=context.nodes,
         )
@@ -589,7 +609,7 @@ def solve_best_move(
             score=depth_result.score,
             top_moves=depth_result.top_moves,
             depth=depth,
-            complete=not context.hit_depth_limit,
+            complete=(not context.hit_depth_limit and not context.used_unproven_tt),
             elapsed_ms=elapsed_ms,
             nodes=total_nodes,
         )

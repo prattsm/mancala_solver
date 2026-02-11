@@ -1,3 +1,4 @@
+import gzip
 import random
 import tempfile
 import unittest
@@ -383,6 +384,37 @@ class TestEngine(unittest.TestCase):
             solver_mod.search_depth(child_state, depth=1, tt=tt)
         result = solve_best_move(state, topn=3, tt=tt, time_limit_ms=200, start_depth=2)
         self.assertFalse(result.complete)
+
+    def test_full_solve_interrupt_returns_partial_result(self):
+        state = initial_state(seeds=4, you_first=True)
+        result = solve_best_move(
+            state,
+            topn=3,
+            tt={},
+            time_limit_ms=None,
+            interrupt_check=lambda: True,
+        )
+        self.assertFalse(result.complete)
+        self.assertIsNotNone(result.best_move)
+
+    def test_load_tt_handles_unexpected_deserialization_error(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            path = Path(tmpdir) / "cache.pkl.gz"
+            with gzip.open(path, "wb") as handle:
+                handle.write(b"not-a-pickle")
+
+            original_pickle_load = solver_mod.pickle.load
+
+            def boom(_handle):
+                raise RuntimeError("boom")
+
+            try:
+                solver_mod.pickle.load = boom
+                loaded = load_tt(path)
+            finally:
+                solver_mod.pickle.load = original_pickle_load
+
+        self.assertEqual(loaded, {})
 
     def test_root_aspiration_researches_bound_scores(self):
         state = initial_state(seeds=1, you_first=True)
