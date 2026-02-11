@@ -91,6 +91,7 @@ class AnimationSettings:
 class SolverWorker(QObject):
     result_ready = Signal(int, object)
     progress = Signal(int, object)
+    live_metrics = Signal(int, int, int)
 
     def __init__(self) -> None:
         super().__init__()
@@ -123,6 +124,11 @@ class SolverWorker(QObject):
                 raise InterruptedError()
             self.progress.emit(request_id, result)
 
+        def _on_live(nodes: int, elapsed_ms: int) -> None:
+            if _is_interrupted():
+                raise InterruptedError()
+            self.live_metrics.emit(request_id, nodes, elapsed_ms)
+
         try:
             with self.tt_lock:
                 result = solve_best_move(
@@ -134,6 +140,7 @@ class SolverWorker(QObject):
                     start_depth=start_depth,
                     guess_score=guess_score,
                     interrupt_check=_is_interrupted,
+                    live_callback=_on_live,
                 )
         except InterruptedError:
             return
@@ -239,6 +246,8 @@ class MancalaWindow(QMainWindow):
         self.search_heartbeat_phase = 0
         self.last_best_update_time: Optional[float] = None
         self.panel_snapshot_key: Optional[Tuple[str, str]] = None
+        self.live_nodes = 0
+        self.live_elapsed_ms = 0
 
         self.anim_counts_you: Optional[List[int]] = None
         self.anim_counts_opp: Optional[List[int]] = None
@@ -459,6 +468,7 @@ class MancalaWindow(QMainWindow):
         self.solver_worker.moveToThread(self.solver_thread)
         self.solve_requested.connect(self.solver_worker.solve)
         self.solver_worker.progress.connect(self.on_solve_progress)
+        self.solver_worker.live_metrics.connect(self.on_solve_live)
         self.solver_worker.result_ready.connect(self.on_solve_result)
         self.solver_thread.start()
 
@@ -688,6 +698,8 @@ class MancalaWindow(QMainWindow):
         self.search_progress = None
         self.last_best_update_time = None
         self.panel_snapshot_key = None
+        self.live_nodes = 0
+        self.live_elapsed_ms = 0
         self.solve_request_id += 1
         self._set_latest_request_id()
         self.solving = False
@@ -722,6 +734,8 @@ class MancalaWindow(QMainWindow):
         self.search_progress = None
         self.last_best_update_time = None
         self.panel_snapshot_key = None
+        self.live_nodes = 0
+        self.live_elapsed_ms = 0
         self.solve_request_id += 1
         self._set_latest_request_id()
         self.solving = False
@@ -793,6 +807,8 @@ class MancalaWindow(QMainWindow):
         self.search_progress = None
         self.last_best_update_time = None
         self.panel_snapshot_key = None
+        self.live_nodes = 0
+        self.live_elapsed_ms = 0
         self.solving = False
         self.solve_request_id += 1
         self._set_latest_request_id()
@@ -1349,6 +1365,8 @@ class MancalaWindow(QMainWindow):
             self.search_progress = None
             self.last_best_update_time = None
             self.panel_snapshot_key = None
+            self.live_nodes = 0
+            self.live_elapsed_ms = 0
         self.solving = True
         self.active_start_depth = max(1, start_depth)
         self._start_slice_progress()
@@ -1360,6 +1378,8 @@ class MancalaWindow(QMainWindow):
         self.current_best_move = result.best_move
         self.current_best_eval = result.score
         self.current_top_moves = list(result.top_moves)
+        self.live_nodes = result.nodes
+        self.live_elapsed_ms = result.elapsed_ms
         if result.best_move is not None:
             if (
                 prev is None
@@ -1384,6 +1404,20 @@ class MancalaWindow(QMainWindow):
             return
         self._apply_search_result(result)
         self.update_recommendations()
+        self.update_status()
+
+    @Slot(int, int, int)
+    def on_solve_live(self, request_id: int, nodes: int, elapsed_ms: int) -> None:
+        if self.closing:
+            return
+        if request_id != self.solve_request_id:
+            return
+        if self.animating:
+            return
+        if self.solve_target_state != self.state:
+            return
+        self.live_nodes = max(self.live_nodes, nodes)
+        self.live_elapsed_ms = max(self.live_elapsed_ms, elapsed_ms)
         self.update_status()
 
     @Slot(int, object)
@@ -1563,6 +1597,10 @@ class MancalaWindow(QMainWindow):
             solved = self.search_progress.complete
             if self.search_progress.best_move is not None:
                 best_text = f"pit {self.search_progress.best_move} ({self.search_progress.score:+d})"
+
+        if self.solving:
+            nodes = max(nodes, self.live_nodes)
+            elapsed_ms = max(elapsed_ms, self.live_elapsed_ms)
 
         turn_text = "Game over" if is_terminal(self.state) else ("Your turn" if self.state.to_move == YOU else "Opponent turn")
 

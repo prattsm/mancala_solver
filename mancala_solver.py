@@ -26,6 +26,8 @@ TT_PRUNE_TO = 800_000
 ASPIRATION_WINDOW_INIT = 4
 ASPIRATION_MAX_RETRIES = 5
 INTERRUPT_POLL_MASK = 0xFF
+LIVE_POLL_MASK = 0x3FF
+LIVE_EMIT_INTERVAL_MS = 120
 
 EXACT = 0
 LOWER = 1
@@ -56,6 +58,7 @@ class _SearchContext:
     tt: Dict[State, TTEntry]
     deadline: Optional[float]
     interrupt_check: Optional[Callable[[], bool]] = None
+    live_nodes_callback: Optional[Callable[[int], None]] = None
     nodes: int = 0
     hit_depth_limit: bool = False
 
@@ -286,6 +289,8 @@ def _check_deadline(context: _SearchContext) -> None:
 def _search_depth(state: State, alpha: int, beta: int, depth: int, context: _SearchContext) -> int:
     _check_deadline(context)
     context.nodes += 1
+    if context.live_nodes_callback is not None and (context.nodes & LIVE_POLL_MASK) == 0:
+        context.live_nodes_callback(context.nodes)
 
     if is_terminal(state):
         return terminal_diff(state)
@@ -459,6 +464,7 @@ def solve_best_move(
     start_depth: int = 1,
     guess_score: Optional[int] = None,
     interrupt_check: Optional[Callable[[], bool]] = None,
+    live_callback: Optional[Callable[[int, int], None]] = None,
 ) -> SearchResult:
     if tt is None:
         tt = {}
@@ -476,8 +482,25 @@ def solve_best_move(
             nodes=0,
         )
 
+    last_live_emit = start
+
+    def _emit_live(nodes: int) -> None:
+        nonlocal last_live_emit
+        if live_callback is None:
+            return
+        now = time.perf_counter()
+        if (now - last_live_emit) * 1000 < LIVE_EMIT_INTERVAL_MS:
+            return
+        live_callback(nodes, int((now - start) * 1000))
+        last_live_emit = now
+
     if time_limit_ms is None:
-        context = _SearchContext(tt=tt, deadline=None, interrupt_check=interrupt_check)
+        context = _SearchContext(
+            tt=tt,
+            deadline=None,
+            interrupt_check=interrupt_check,
+            live_nodes_callback=_emit_live,
+        )
         depth_result = _best_move_depth(state, topn, FULL_DEPTH, context, -INF, INF)
         elapsed_ms = int((time.perf_counter() - start) * 1000)
         result = SearchResult(
@@ -489,6 +512,7 @@ def solve_best_move(
             elapsed_ms=elapsed_ms,
             nodes=context.nodes,
         )
+        _emit_live(result.nodes)
         if progress_callback is not None:
             progress_callback(result)
         return result
@@ -503,7 +527,12 @@ def solve_best_move(
         if time.perf_counter() >= deadline:
             break
 
-        context = _SearchContext(tt=tt, deadline=deadline, interrupt_check=interrupt_check)
+        context = _SearchContext(
+            tt=tt,
+            deadline=deadline,
+            interrupt_check=interrupt_check,
+            live_nodes_callback=lambda iter_nodes, base_nodes=total_nodes: _emit_live(base_nodes + iter_nodes),
+        )
         try:
             depth_result = _run_depth_iteration_with_aspiration(
                 state=state,
@@ -517,6 +546,7 @@ def solve_best_move(
 
         total_nodes += context.nodes
         elapsed_ms = int((time.perf_counter() - start) * 1000)
+        _emit_live(total_nodes)
         result = SearchResult(
             best_move=depth_result.best_move,
             score=depth_result.score,
