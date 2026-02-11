@@ -62,7 +62,7 @@ from mancala_engine import (
 from mancala_solver import SearchResult, default_cache_path, load_tt, save_tt, solve_best_move
 from mancala_telemetry import ThreadedTCPSink, parse_host_port
 
-SOLVE_SLICE_MS = 300
+SOLVE_SLICE_MS = 500
 SOLVE_REQUEUE_DELAY_MS = 50
 SETTINGS_ORG = "prattsm"
 SETTINGS_APP = "mancala_solver"
