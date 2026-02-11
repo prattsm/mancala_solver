@@ -42,6 +42,7 @@ python3 -m unittest discover -s tests
 - Use the animation controls to adjust speed or replay the last move.
 - While solving, the status line shows iterative-deepening progress with a provisional best move.
 - When the solver fully proves the position, the status line shows `Solved (perfect)`.
+- GUI continues timed deepening passes in the background until a perfect result is proven.
 
 ## Notes
 - Board display shows opponent pits left-to-right as `1..6` and your pits left-to-right as `6..1`.

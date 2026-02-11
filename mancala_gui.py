@@ -1112,24 +1112,36 @@ class MancalaWindow(QMainWindow):
             self.update_status()
             return
 
-        if self.solve_target_state == self.state and self.current_best_move is not None and not self.solving:
+        has_result_for_state = self.solve_target_state == self.state and self.current_best_move is not None
+        if (
+            has_result_for_state
+            and not self.solving
+            and (self.search_progress is None or self.search_progress.complete)
+        ):
             self.update_recommendations()
             self.update_status()
             return
 
-        self._start_solve_for(self.state)
+        preserve_progress = (
+            has_result_for_state
+            and not self.solving
+            and self.search_progress is not None
+            and not self.search_progress.complete
+        )
+        self._start_solve_for(self.state, preserve_progress=preserve_progress)
 
         self.update_recommendations()
         self.update_status()
 
-    def _start_solve_for(self, state: State) -> None:
+    def _start_solve_for(self, state: State, preserve_progress: bool = False) -> None:
         if self.closing:
             return
         self.solve_request_id += 1
         self.solve_target_state = state
         self.deferred_result = None
         self.deferred_result_state = None
-        self.search_progress = None
+        if not preserve_progress:
+            self.search_progress = None
         self.solving = True
         self.solve_requested.emit(state, self.topn, self.solve_request_id, self.solve_time_limit_ms)
 
@@ -1176,6 +1188,8 @@ class MancalaWindow(QMainWindow):
         self.update_recommendations()
         self.update_status()
         self._maybe_autoplay(request_id)
+        if not result.complete:
+            QTimer.singleShot(0, self.schedule_solve_if_needed)
 
     def update_pit_labels(self) -> None:
         pits_you, pits_opp, _, _ = self._display_counts()
