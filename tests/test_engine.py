@@ -101,13 +101,23 @@ class TestEngine(unittest.TestCase):
         self.assertIsNotNone(info.trace.capture)
         self.assertEqual(info.trace.capture.opposite_index, 5 - info.trace.capture.landing_index)
 
-    def test_capture_when_opposite_empty_moves_single_seed(self):
+    def test_no_capture_when_opposite_empty_you(self):
         state = make_state(YOU, [0, 0, 1, 0, 0, 1], [2, 0, 0, 0, 0, 0])
         info = apply_move_with_info(state, 3)
-        self.assertTrue(info.capture)
-        self.assertEqual(info.state.store_you, 1)
-        self.assertEqual(info.state.pits_you[1], 0)
+        self.assertFalse(info.capture)
+        self.assertIsNone(info.trace.capture)
+        self.assertEqual(info.state.store_you, 0)
+        self.assertEqual(info.state.pits_you[1], 1)
         self.assertEqual(info.state.pits_opp[4], 0)
+
+    def test_no_capture_when_opposite_empty_opp(self):
+        state = make_state(OPP, [1, 0, 0, 0, 0, 0], [0, 1, 0, 0, 0, 1])
+        info = apply_move_with_info(state, 2)
+        self.assertFalse(info.capture)
+        self.assertIsNone(info.trace.capture)
+        self.assertEqual(info.state.store_opp, 0)
+        self.assertEqual(info.state.pits_opp[0], 1)
+        self.assertEqual(info.state.pits_you[5], 0)
 
     def test_no_capture_when_last_drop_is_store(self):
         state = make_state(YOU, [0, 0, 0, 4, 0, 0], [1, 0, 0, 0, 0, 0])

@@ -191,8 +191,8 @@ def _apply_move_fast(state: State, pit_num: int) -> tuple[State, bool, bool]:
     if to_move == YOU and last_loc.side == YOU and last_loc.index is not None:
         if pits_you[last_loc.index] == 1:
             opp_i = 5 - last_loc.index
-            captured = pits_opp[opp_i] + pits_you[last_loc.index]
-            if captured > 0:
+            if pits_opp[opp_i] > 0:
+                captured = pits_opp[opp_i] + pits_you[last_loc.index]
                 store_you += captured
                 pits_you[last_loc.index] = 0
                 pits_opp[opp_i] = 0
@@ -200,8 +200,8 @@ def _apply_move_fast(state: State, pit_num: int) -> tuple[State, bool, bool]:
     elif to_move == OPP and last_loc.side == OPP and last_loc.index is not None:
         if pits_opp[last_loc.index] == 1:
             you_i = 5 - last_loc.index
-            captured = pits_you[you_i] + pits_opp[last_loc.index]
-            if captured > 0:
+            if pits_you[you_i] > 0:
+                captured = pits_you[you_i] + pits_opp[last_loc.index]
                 store_opp += captured
                 pits_you[you_i] = 0
                 pits_opp[last_loc.index] = 0
@@ -243,8 +243,8 @@ def _apply_move(state: State, pit_num: int) -> tuple[State, bool, bool, MoveTrac
     if to_move == YOU and last.side == YOU and last.index is not None:
         if pits_you[last.index] == 1:
             opp_i = 5 - last.index
-            captured = pits_opp[opp_i] + pits_you[last.index]
-            if captured > 0:
+            if pits_opp[opp_i] > 0:
+                captured = pits_opp[opp_i] + pits_you[last.index]
                 store_you += captured
                 pits_you[last.index] = 0
                 pits_opp[opp_i] = 0
@@ -260,8 +260,8 @@ def _apply_move(state: State, pit_num: int) -> tuple[State, bool, bool, MoveTrac
     elif to_move == OPP and last.side == OPP and last.index is not None:
         if pits_opp[last.index] == 1:
             you_i = 5 - last.index
-            captured = pits_you[you_i] + pits_opp[last.index]
-            if captured > 0:
+            if pits_you[you_i] > 0:
+                captured = pits_you[you_i] + pits_opp[last.index]
                 store_opp += captured
                 pits_you[you_i] = 0
                 pits_opp[last.index] = 0
