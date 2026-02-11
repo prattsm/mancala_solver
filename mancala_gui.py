@@ -235,6 +235,8 @@ class MancalaWindow(QMainWindow):
         self.requeue_pending = False
         self.slice_start_time: Optional[float] = None
         self.slice_hide_token = 0
+        self.active_start_depth = 1
+        self.search_heartbeat_phase = 0
 
         self.anim_counts_you: Optional[List[int]] = None
         self.anim_counts_opp: Optional[List[int]] = None
@@ -254,7 +256,7 @@ class MancalaWindow(QMainWindow):
         self._build_ui()
         self._setup_solver()
         self.slice_progress_timer = QTimer(self)
-        self.slice_progress_timer.setInterval(33)
+        self.slice_progress_timer.setInterval(100)
         self.slice_progress_timer.timeout.connect(self._update_slice_progress_bar)
         self._apply_style()
 
@@ -384,6 +386,11 @@ class MancalaWindow(QMainWindow):
 
         side_panel.addWidget(self.anim_panel)
 
+        self.slice_progress_label = QLabel("Slice: -")
+        self.slice_progress_label.setObjectName("SliceProgress")
+        self.slice_progress_label.hide()
+        side_panel.addWidget(self.slice_progress_label)
+
         self.slice_progress = QProgressBar()
         self.slice_progress.setRange(0, SOLVE_SLICE_MS)
         self.slice_progress.setValue(0)
@@ -392,7 +399,11 @@ class MancalaWindow(QMainWindow):
         self.slice_progress.hide()
         side_panel.addWidget(self.slice_progress)
 
-        self.top_moves_label = QLabel("Top moves: -")
+        top_moves_header = QLabel("Top Moves")
+        top_moves_header.setObjectName("SideHeader")
+        side_panel.addWidget(top_moves_header)
+
+        self.top_moves_label = QLabel("-")
         self.top_moves_label.setObjectName("TopMoves")
         self.top_moves_label.setWordWrap(True)
         side_panel.addWidget(self.top_moves_label)
@@ -432,22 +443,31 @@ class MancalaWindow(QMainWindow):
     def _start_slice_progress(self) -> None:
         self.slice_hide_token += 1
         self.slice_start_time = time.perf_counter()
+        self.search_heartbeat_phase = 0
         self.slice_progress.setRange(0, SOLVE_SLICE_MS)
         self.slice_progress.setValue(0)
+        self.slice_progress_label.setText(f"Slice: 0/{SOLVE_SLICE_MS} ms")
+        self.slice_progress_label.show()
         self.slice_progress.show()
         if not self.slice_progress_timer.isActive():
             self.slice_progress_timer.start()
+        self.update_status()
 
     def _update_slice_progress_bar(self) -> None:
         if self.slice_start_time is None:
             return
         elapsed_ms = int((time.perf_counter() - self.slice_start_time) * 1000)
-        self.slice_progress.setValue(min(SOLVE_SLICE_MS, max(0, elapsed_ms)))
+        shown_ms = min(SOLVE_SLICE_MS, max(0, elapsed_ms))
+        self.slice_progress.setValue(shown_ms)
+        self.slice_progress_label.setText(f"Slice: {shown_ms}/{SOLVE_SLICE_MS} ms")
+        self.search_heartbeat_phase = (self.search_heartbeat_phase + 1) % 4
+        self.update_status()
 
     def _finish_slice_progress(self, hide_after_ms: Optional[int] = None) -> None:
         self.slice_start_time = None
         self.slice_progress_timer.stop()
         self.slice_progress.setValue(SOLVE_SLICE_MS)
+        self.slice_progress_label.setText(f"Slice: {SOLVE_SLICE_MS}/{SOLVE_SLICE_MS} ms")
         if hide_after_ms is None:
             return
         token = self.slice_hide_token
@@ -460,9 +480,19 @@ class MancalaWindow(QMainWindow):
             return
         if self.animating or self.state.to_move != YOU:
             self.slice_progress.hide()
+            self.slice_progress_label.hide()
             return
         if self.search_progress is None or self.search_progress.complete:
             self.slice_progress.hide()
+            self.slice_progress_label.hide()
+
+    @staticmethod
+    def _format_nodes(value: int) -> str:
+        if value >= 1_000_000:
+            return f"{value / 1_000_000:.1f}M"
+        if value >= 1_000:
+            return f"{value / 1_000:.1f}k"
+        return str(value)
 
     def _queue_requeue_solve(self) -> None:
         if self.closing or self.requeue_pending:
@@ -492,6 +522,7 @@ class MancalaWindow(QMainWindow):
             QLabel#SideHeader { font-weight: 600; margin-top: 8px; }
             QLabel#Status { padding-top: 6px; }
             QLabel#TopMoves { color: #f0e6d6; }
+            QLabel#SliceProgress { color: #e9ddc8; font-size: 10px; }
             QFrame#SidePanel {
                 background: rgba(15, 28, 20, 0.35);
                 border: 1px solid rgba(255, 255, 255, 0.08);
@@ -630,6 +661,7 @@ class MancalaWindow(QMainWindow):
         self.solving = False
         self.requeue_pending = False
         self.slice_progress.hide()
+        self.slice_progress_label.hide()
         self.slice_progress_timer.stop()
         self.slice_start_time = None
         self._clear_anim_counts()
@@ -661,6 +693,7 @@ class MancalaWindow(QMainWindow):
         self.solving = False
         self.requeue_pending = False
         self.slice_progress.hide()
+        self.slice_progress_label.hide()
         self.slice_progress_timer.stop()
         self.slice_start_time = None
         self._clear_anim_counts()
@@ -729,6 +762,7 @@ class MancalaWindow(QMainWindow):
         self._set_latest_request_id()
         self.requeue_pending = False
         self.slice_progress.hide()
+        self.slice_progress_label.hide()
         self.slice_progress_timer.stop()
         self.slice_start_time = None
 
@@ -1278,6 +1312,7 @@ class MancalaWindow(QMainWindow):
         if not preserve_progress:
             self.search_progress = None
         self.solving = True
+        self.active_start_depth = max(1, start_depth)
         self._start_slice_progress()
         self.solve_requested.emit(state, self.topn, self.solve_request_id, start_depth, guess_score)
 
@@ -1442,55 +1477,83 @@ class MancalaWindow(QMainWindow):
                     button.set_recommended(True)
 
         if is_terminal(self.state):
-            self.top_moves_label.setText("Top moves: -")
+            self.top_moves_label.setText("-")
             self.play_best_button.setEnabled(False)
             return
 
         if self.animating:
-            self.top_moves_label.setText("Top moves: -")
+            self.top_moves_label.setText("-")
             self.play_best_button.setEnabled(False)
             return
 
         if self.state.to_move != YOU:
-            self.top_moves_label.setText("Top moves: -")
+            self.top_moves_label.setText("-")
             self.play_best_button.setEnabled(False)
             return
 
         if not self.current_top_moves:
-            self.top_moves_label.setText("Top moves: -")
+            self.top_moves_label.setText("-")
             self.play_best_button.setEnabled(False)
             return
 
         parts = [f"pit {move} ({score:+d})" for move, score in self.current_top_moves]
-        self.top_moves_label.setText(f"Top moves: {' | '.join(parts)}")
+        self.top_moves_label.setText(" | ".join(parts))
         self.play_best_button.setEnabled(self.current_best_move is not None)
 
     def update_status(self) -> None:
-        depth = 0
+        completed_depth = 0
+        probe_depth: Optional[int] = None
         nodes = 0
+        elapsed_ms = 0
         best_text = "-"
-        completeness = "incomplete"
+        solved = False
 
         if self.search_progress is not None:
-            depth = self.search_progress.depth
+            completed_depth = self.search_progress.depth
             nodes = self.search_progress.nodes
+            elapsed_ms = self.search_progress.elapsed_ms
+            solved = self.search_progress.complete
             if self.search_progress.best_move is not None:
                 best_text = f"pit {self.search_progress.best_move} ({self.search_progress.score:+d})"
-            completeness = "complete" if self.search_progress.complete else "incomplete"
-
-        if self.solving and completeness != "complete":
-            completeness = "incomplete (searching)"
 
         if is_terminal(self.state):
+            primary = "Game over"
             turn_text = "Game over"
-            completeness = "complete"
+            solved = True
             if best_text == "-":
                 best_text = f"diff {final_diff(self.state):+d}"
         else:
             turn_text = "Your turn" if self.state.to_move == YOU else "Opponent turn"
+            if solved:
+                primary = "Solved (perfect)"
+            elif self.solving and self.state.to_move == YOU:
+                dots = "." * self.search_heartbeat_phase
+                primary = f"Searching (best so far){dots}"
+            elif self.search_progress is not None and self.state.to_move == YOU:
+                primary = "Best so far"
+            else:
+                primary = "Idle"
+
+        if self.solving and self.state.to_move == YOU and not solved:
+            if self.search_progress is None:
+                probe_depth = self.active_start_depth
+            else:
+                probe_depth = max(self.active_start_depth, completed_depth + 1)
+
+        depth_text = f"{completed_depth} complete"
+        if probe_depth is not None:
+            depth_text += f", probing {probe_depth}"
+
+        nps = 0
+        if elapsed_ms > 0:
+            nps = int(nodes * 1000 / elapsed_ms)
+        elapsed_s = elapsed_ms / 1000.0
+        solved_text = "perfect" if solved else "provisional"
 
         self.status_label.setText(
-            f"Turn: {turn_text} | Depth: {depth} | Nodes: {nodes} | Best: {best_text} | {completeness}"
+            f"{primary} | Turn: {turn_text} | Depth: {depth_text} | Best: {best_text} | "
+            f"Nodes: {self._format_nodes(nodes)} | NPS: {self._format_nodes(nps)}/s | "
+            f"Elapsed: {elapsed_s:.1f}s | {solved_text}"
         )
 
     def _format_drop_location(self, drop: DropLocation) -> str:
@@ -1510,6 +1573,7 @@ class MancalaWindow(QMainWindow):
         self.slice_progress_timer.stop()
         self.slice_start_time = None
         self.slice_progress.hide()
+        self.slice_progress_label.hide()
         if self.anim_group is not None:
             try:
                 self.anim_group.finished.disconnect()
