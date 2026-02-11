@@ -92,8 +92,15 @@ class SolverWorker(QObject):
         self.tt = {}
         self.tt_lock = threading.Lock()
 
-    @Slot(object, int, int)
-    def solve(self, state: State, topn: int, request_id: int) -> None:
+    @Slot(object, int, int, int, object)
+    def solve(
+        self,
+        state: State,
+        topn: int,
+        request_id: int,
+        start_depth: int,
+        guess_score: Optional[int],
+    ) -> None:
         if QThread.currentThread().isInterruptionRequested():
             return
 
@@ -110,6 +117,8 @@ class SolverWorker(QObject):
                     tt=self.tt,
                     time_limit_ms=300,
                     progress_callback=_on_progress,
+                    start_depth=start_depth,
+                    guess_score=guess_score,
                 )
         except InterruptedError:
             return
@@ -178,7 +187,7 @@ class StoreWidget(QFrame):
 
 
 class MancalaWindow(QMainWindow):
-    solve_requested = Signal(object, int, int)
+    solve_requested = Signal(object, int, int, int, object)
 
     def __init__(self) -> None:
         super().__init__()
@@ -1127,12 +1136,27 @@ class MancalaWindow(QMainWindow):
             and self.search_progress is not None
             and not self.search_progress.complete
         )
-        self._start_solve_for(self.state, preserve_progress=preserve_progress)
+        if preserve_progress and self.search_progress is not None:
+            next_depth = max(1, self.search_progress.depth + 1)
+            self._start_solve_for(
+                self.state,
+                preserve_progress=True,
+                start_depth=next_depth,
+                guess_score=self.search_progress.score,
+            )
+        else:
+            self._start_solve_for(self.state, preserve_progress=False, start_depth=1, guess_score=None)
 
         self.update_recommendations()
         self.update_status()
 
-    def _start_solve_for(self, state: State, preserve_progress: bool = False) -> None:
+    def _start_solve_for(
+        self,
+        state: State,
+        preserve_progress: bool = False,
+        start_depth: int = 1,
+        guess_score: Optional[int] = None,
+    ) -> None:
         if self.closing:
             return
         self.solve_request_id += 1
@@ -1142,7 +1166,7 @@ class MancalaWindow(QMainWindow):
         if not preserve_progress:
             self.search_progress = None
         self.solving = True
-        self.solve_requested.emit(state, self.topn, self.solve_request_id)
+        self.solve_requested.emit(state, self.topn, self.solve_request_id, start_depth, guess_score)
 
     def _apply_search_result(self, result: SearchResult) -> None:
         self.search_progress = result

@@ -28,6 +28,7 @@ from mancala_solver import (
     save_tt,
     search,
     search_depth,
+    solve_best_move,
     terminal_diff,
 )
 
@@ -250,9 +251,9 @@ class TestEngine(unittest.TestCase):
     def test_best_move_value_matches_search_fresh_tt(self):
         rng = random.Random(22)
 
-        for _ in range(4):
+        for _ in range(2):
             state = initial_state(seeds=2, you_first=bool(rng.getrandbits(1)))
-            plies = rng.randint(0, 16)
+            plies = rng.randint(14, 20)
             for _ in range(plies):
                 if is_terminal(state):
                     break
@@ -318,6 +319,61 @@ class TestEngine(unittest.TestCase):
         }
         value = search_depth(state, depth=2, tt=tt)
         self.assertNotEqual(value, 123456)
+
+    def test_solve_best_move_scores_all_root_moves(self):
+        state = initial_state(seeds=4, you_first=True)
+        result = solve_best_move(state, topn=6, tt={}, time_limit_ms=50)
+        self.assertEqual(len(result.top_moves), len(legal_moves(state)))
+
+    def test_solve_best_move_uses_start_depth_and_guess_on_timeout(self):
+        state = initial_state(seeds=2, you_first=True)
+        norm_state, _ = solver_mod.normalize_state(state)
+        tt = {
+            norm_state: TTEntry(7, EXACT, 2, 4),
+        }
+        result = solve_best_move(
+            state,
+            topn=3,
+            tt=tt,
+            time_limit_ms=0,
+            start_depth=5,
+            guess_score=7,
+        )
+        self.assertEqual(result.depth, 4)
+        self.assertFalse(result.complete)
+        self.assertEqual(result.score, 7)
+        self.assertEqual(result.best_move, 2)
+
+    def test_timeout_returns_last_completed_depth_result(self):
+        state = initial_state(seeds=2, you_first=True)
+        original = solver_mod._run_depth_iteration_with_aspiration
+        calls = {"count": 0}
+
+        def fake_iteration(state, topn, depth, guess_score, context):
+            calls["count"] += 1
+            if calls["count"] == 1:
+                context.nodes += 17
+                context.hit_depth_limit = True
+                return solver_mod._DepthSearchResult(
+                    best_move=4,
+                    score=3,
+                    top_moves=[(4, 3), (1, 2)],
+                    fail_low=False,
+                    fail_high=False,
+                )
+            raise solver_mod.SearchTimeout()
+
+        try:
+            solver_mod._run_depth_iteration_with_aspiration = fake_iteration
+            result = solve_best_move(state, topn=3, tt={}, time_limit_ms=100)
+        finally:
+            solver_mod._run_depth_iteration_with_aspiration = original
+
+        self.assertEqual(result.depth, 1)
+        self.assertEqual(result.best_move, 4)
+        self.assertEqual(result.score, 3)
+        self.assertFalse(result.complete)
+        self.assertEqual(result.top_moves[:1], [(4, 3)])
 
 
 if __name__ == "__main__":

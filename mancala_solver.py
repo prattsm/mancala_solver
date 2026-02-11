@@ -23,6 +23,8 @@ FULL_DEPTH = 1_000_000
 CACHE_VERSION = 5
 TT_MAX_ENTRIES = 1_000_000
 TT_PRUNE_TO = 800_000
+ASPIRATION_WINDOW_INIT = 4
+ASPIRATION_MAX_RETRIES = 5
 
 EXACT = 0
 LOWER = 1
@@ -54,6 +56,15 @@ class _SearchContext:
     deadline: Optional[float]
     nodes: int = 0
     hit_depth_limit: bool = False
+
+
+@dataclass(frozen=True)
+class _DepthSearchResult:
+    best_move: Optional[int]
+    score: int
+    top_moves: List[Tuple[int, int]]
+    fail_low: bool
+    fail_high: bool
 
 
 class SearchTimeout(Exception):
@@ -351,42 +362,67 @@ def _best_move_depth(
     topn: int,
     depth: int,
     context: _SearchContext,
-) -> Tuple[Optional[int], int, List[Tuple[int, int]]]:
+    alpha: int = -INF,
+    beta: int = INF,
+) -> _DepthSearchResult:
     children = ordered_children(state, context.tt)
     if not children:
-        return None, terminal_diff(state), []
+        score = terminal_diff(state)
+        return _DepthSearchResult(
+            best_move=None,
+            score=score,
+            top_moves=[],
+            fail_low=score <= alpha,
+            fail_high=score >= beta,
+        )
 
     scored: List[Tuple[int, int]] = []
     if state.to_move == YOU:
-        alpha = -INF
-        beta = INF
-        best_val = -INF
         for move, child_state, _, _, _ in children:
             val = _search_depth(child_state, alpha, beta, depth - 1, context)
             scored.append((move, val))
-            if val > best_val:
-                best_val = val
-            alpha = max(alpha, best_val)
-            if alpha >= beta:
-                break
         scored.sort(key=lambda item: item[1], reverse=True)
     else:
-        alpha = -INF
-        beta = INF
-        best_val = INF
         for move, child_state, _, _, _ in children:
             val = _search_depth(child_state, alpha, beta, depth - 1, context)
             scored.append((move, val))
-            if val < best_val:
-                best_val = val
-            beta = min(beta, best_val)
-            if alpha >= beta:
-                break
         scored.sort(key=lambda item: item[1])
 
     topn = max(0, topn)
     top_moves = scored[:topn] if topn > 0 else []
-    return scored[0][0], scored[0][1], top_moves
+    best_move = scored[0][0]
+    best_score = scored[0][1]
+    return _DepthSearchResult(
+        best_move=best_move,
+        score=best_score,
+        top_moves=top_moves,
+        fail_low=best_score <= alpha,
+        fail_high=best_score >= beta,
+    )
+
+
+def _run_depth_iteration_with_aspiration(
+    state: State,
+    topn: int,
+    depth: int,
+    guess_score: Optional[int],
+    context: _SearchContext,
+) -> _DepthSearchResult:
+    if guess_score is None:
+        return _best_move_depth(state, topn, depth, context, -INF, INF)
+
+    window = max(1, ASPIRATION_WINDOW_INIT)
+    retries = 0
+    while True:
+        alpha = guess_score - window
+        beta = guess_score + window
+        outcome = _best_move_depth(state, topn, depth, context, alpha, beta)
+        if not outcome.fail_low and not outcome.fail_high:
+            return outcome
+        retries += 1
+        if retries >= ASPIRATION_MAX_RETRIES:
+            return _best_move_depth(state, topn, depth, context, -INF, INF)
+        window *= 2
 
 
 def _fallback_best_move(state: State, topn: int) -> Tuple[Optional[int], int, List[Tuple[int, int]]]:
@@ -412,6 +448,8 @@ def solve_best_move(
     tt: Optional[Dict[State, TTEntry]] = None,
     time_limit_ms: Optional[int] = None,
     progress_callback: Optional[Callable[[SearchResult], None]] = None,
+    start_depth: int = 1,
+    guess_score: Optional[int] = None,
 ) -> SearchResult:
     if tt is None:
         tt = {}
@@ -431,12 +469,12 @@ def solve_best_move(
 
     if time_limit_ms is None:
         context = _SearchContext(tt=tt, deadline=None)
-        move, score, top_moves = _best_move_depth(state, topn, FULL_DEPTH, context)
+        depth_result = _best_move_depth(state, topn, FULL_DEPTH, context, -INF, INF)
         elapsed_ms = int((time.perf_counter() - start) * 1000)
         result = SearchResult(
-            best_move=move,
-            score=score,
-            top_moves=top_moves,
+            best_move=depth_result.best_move,
+            score=depth_result.score,
+            top_moves=depth_result.top_moves,
             depth=0,
             complete=True,
             elapsed_ms=elapsed_ms,
@@ -449,7 +487,8 @@ def solve_best_move(
     deadline = start + max(0, time_limit_ms) / 1000.0
     total_nodes = 0
     best_result: Optional[SearchResult] = None
-    depth = 1
+    depth = max(1, start_depth)
+    current_guess = guess_score
 
     while True:
         if time.perf_counter() >= deadline:
@@ -457,16 +496,22 @@ def solve_best_move(
 
         context = _SearchContext(tt=tt, deadline=deadline)
         try:
-            move, score, top_moves = _best_move_depth(state, topn, depth, context)
+            depth_result = _run_depth_iteration_with_aspiration(
+                state=state,
+                topn=topn,
+                depth=depth,
+                guess_score=current_guess,
+                context=context,
+            )
         except SearchTimeout:
             break
 
         total_nodes += context.nodes
         elapsed_ms = int((time.perf_counter() - start) * 1000)
         result = SearchResult(
-            best_move=move,
-            score=score,
-            top_moves=top_moves,
+            best_move=depth_result.best_move,
+            score=depth_result.score,
+            top_moves=depth_result.top_moves,
             depth=depth,
             complete=not context.hit_depth_limit,
             elapsed_ms=elapsed_ms,
@@ -477,12 +522,27 @@ def solve_best_move(
             progress_callback(result)
         if result.complete:
             return result
+        current_guess = result.score
         depth += 1
 
     if best_result is not None:
         return best_result
 
-    # Deadline was hit before depth 1 could complete.
+    # Deadline was hit before completing the first requested depth.
+    if start_depth > 1 and guess_score is not None:
+        move_guess = _tt_best_move(state, tt)
+        elapsed_ms = int((time.perf_counter() - start) * 1000)
+        top_guess = [(move_guess, guess_score)] if move_guess is not None else []
+        return SearchResult(
+            best_move=move_guess,
+            score=guess_score,
+            top_moves=top_guess,
+            depth=start_depth - 1,
+            complete=False,
+            elapsed_ms=elapsed_ms,
+            nodes=0,
+        )
+
     move, score, top_moves = _fallback_best_move(state, topn)
     elapsed_ms = int((time.perf_counter() - start) * 1000)
     return SearchResult(
