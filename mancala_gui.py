@@ -93,8 +93,12 @@ class SolverWorker(QObject):
 
     @Slot(object, int, int)
     def solve(self, state: State, topn: int, request_id: int) -> None:
+        if QThread.currentThread().isInterruptionRequested():
+            return
         with self.tt_lock:
             move, eval_score, top_moves = best_move(state, topn=topn, tt=self.tt)
+        if QThread.currentThread().isInterruptionRequested():
+            return
         self.result_ready.emit(request_id, (move, eval_score, top_moves))
 
     def set_cache(self, tt) -> None:
@@ -185,6 +189,7 @@ class MancalaWindow(QMainWindow):
         self.deferred_result_state: Optional[State] = None
         self.solving = False
         self.animating = False
+        self.closing = False
 
         self.anim_counts_you: Optional[List[int]] = None
         self.anim_counts_opp: Optional[List[int]] = None
@@ -195,8 +200,8 @@ class MancalaWindow(QMainWindow):
         self.pending_trace: Optional[MoveTrace] = None
         self.pending_pre_counts: Optional[CountsSnapshot] = None
 
-        self.you_buttons_by_index: List[PitButton] = [None] * 6
-        self.opp_buttons_by_index: List[PitButton] = [None] * 6
+        self.you_buttons_by_index: List[Optional[PitButton]] = [None] * 6
+        self.opp_buttons_by_index: List[Optional[PitButton]] = [None] * 6
 
         self.overlay: Optional[QWidget] = None
         self.anim_group: Optional[QSequentialAnimationGroup] = None
@@ -651,7 +656,13 @@ class MancalaWindow(QMainWindow):
             self._start_solve_for(self.pending_state)
 
         if self.anim_group is not None:
+            try:
+                self.anim_group.finished.disconnect()
+            except (RuntimeError, TypeError):
+                pass
             self.anim_group.stop()
+            self.anim_group.deleteLater()
+            self.anim_group = None
         self.anim_group = QSequentialAnimationGroup(self)
 
         picked_widget = self._widget_for_pit(trace.mover, trace.picked_index)
@@ -680,8 +691,14 @@ class MancalaWindow(QMainWindow):
             self._finish_animation(commit)
             return
 
-        self.anim_group.finished.connect(lambda: self._finish_animation(commit))
+        self.anim_group.finished.connect(lambda: self._on_anim_group_finished(commit))
         self.anim_group.start()
+
+    def _on_anim_group_finished(self, commit: bool) -> None:
+        if self.anim_group is not None:
+            self.anim_group.deleteLater()
+            self.anim_group = None
+        self._finish_animation(commit)
 
     def _finish_animation(self, commit: bool) -> None:
         self.animating = False
@@ -726,6 +743,8 @@ class MancalaWindow(QMainWindow):
         return self.overlay.mapFromGlobal(global_center)
 
     def _widget_for_pit(self, side: str, index: int) -> Optional[QWidget]:
+        if index < 0 or index >= 6:
+            return None
         if side == YOU:
             return self.you_buttons_by_index[index]
         if side == OPP:
@@ -734,8 +753,14 @@ class MancalaWindow(QMainWindow):
 
     def _widget_for_drop(self, drop: DropLocation) -> Optional[QWidget]:
         if drop.side == "STORE":
-            return self.you_store if drop.store == YOU else self.opp_store
-        return self._widget_for_pit(drop.side, drop.index or 0)
+            if drop.store == YOU:
+                return self.you_store
+            if drop.store == OPP:
+                return self.opp_store
+            return None
+        if drop.index is None:
+            return None
+        return self._widget_for_pit(drop.side, drop.index)
 
     def _create_token(self, center: QPoint, size: int, text: str = "", object_name: str = "SeedToken") -> QLabel:
         if self.overlay is None:
@@ -795,7 +820,12 @@ class MancalaWindow(QMainWindow):
         current_pos = self._center_for_widget(picked_widget)
 
         def add_drop_animation(drop: DropLocation, start_pos: QPoint) -> QPoint:
-            end_pos = self._center_for_widget(self._widget_for_drop(drop))
+            dest_widget = self._widget_for_drop(drop)
+            if dest_widget is None:
+                if settings.show_step:
+                    self._apply_drop_to_anim_counts(drop)
+                return start_pos
+            end_pos = self._center_for_widget(dest_widget)
             token = self._create_token(start_pos, 12)
             anim = QPropertyAnimation(token, b"pos")
             anim.setDuration(settings.per_drop_ms)
@@ -807,9 +837,7 @@ class MancalaWindow(QMainWindow):
                 token.deleteLater()
                 if settings.show_step:
                     self._apply_drop_to_anim_counts(drop)
-                dest_widget = self._widget_for_drop(drop)
-                if dest_widget is not None:
-                    self._flash_widget_quick(dest_widget, 80)
+                self._flash_widget_quick(dest_widget, 80)
 
             anim.finished.connect(on_finished)
             group.addAnimation(anim)
@@ -822,7 +850,9 @@ class MancalaWindow(QMainWindow):
             if settings.show_step:
                 self._apply_bulk_counts(middle)
             self._add_skip_label_step(group)
-            current_pos = self._center_for_widget(self._widget_for_drop(middle[-1]))
+            middle_widget = self._widget_for_drop(middle[-1])
+            if middle_widget is not None:
+                current_pos = self._center_for_widget(middle_widget)
 
         for drop in tail:
             current_pos = add_drop_animation(drop, current_pos)
@@ -870,9 +900,10 @@ class MancalaWindow(QMainWindow):
         start_center_opp = self._center_for_widget(opposite_widget)
         end_center = self._center_for_widget(store_widget)
 
-        bundle_text = f"x{capture.captured_count}" if capture.captured_count > 1 else ""
-        token_a = self._create_token(start_center, 18, bundle_text, "SeedBundle")
-        token_b = self._create_token(start_center_opp, 18, bundle_text, "SeedBundle")
+        opposite_count = max(0, capture.captured_count - 1)
+        opposite_text = f"x{opposite_count}" if opposite_count > 0 else ""
+        token_a = self._create_token(start_center, 18, "x1", "SeedBundle")
+        token_b = self._create_token(start_center_opp, 18, opposite_text, "SeedBundle")
 
         anim_a = QPropertyAnimation(token_a, b"pos")
         anim_a.setDuration(400)
@@ -909,42 +940,46 @@ class MancalaWindow(QMainWindow):
             return
 
         if trace.sweep_you > 0:
-            start = self._center_for_widget(self.you_buttons_by_index[2])
-            end = self._center_for_widget(self.you_store)
-            token = self._create_token(start, 20, f"x{trace.sweep_you}", "SeedBundle")
-            anim = QPropertyAnimation(token, b"pos")
-            anim.setDuration(400)
-            anim.setStartValue(start - QPoint(10, 10))
-            anim.setEndValue(end - QPoint(10, 10))
-            anim.setEasingCurve(QEasingCurve.InOutQuad)
-            group.addAnimation(anim)
+            start_widget = self.you_buttons_by_index[2]
+            if start_widget is not None:
+                start = self._center_for_widget(start_widget)
+                end = self._center_for_widget(self.you_store)
+                token = self._create_token(start, 20, f"x{trace.sweep_you}", "SeedBundle")
+                anim = QPropertyAnimation(token, b"pos")
+                anim.setDuration(400)
+                anim.setStartValue(start - QPoint(10, 10))
+                anim.setEndValue(end - QPoint(10, 10))
+                anim.setEasingCurve(QEasingCurve.InOutQuad)
+                group.addAnimation(anim)
 
-            def sweep_you_done() -> None:
-                token.deleteLater()
-                if settings.show_step:
-                    self._apply_sweep_counts(trace.sweep_you, 0)
-                self._flash_widget_quick(self.you_store, 120)
+                def sweep_you_done() -> None:
+                    token.deleteLater()
+                    if settings.show_step:
+                        self._apply_sweep_counts(trace.sweep_you, 0)
+                    self._flash_widget_quick(self.you_store, 120)
 
-            anim.finished.connect(sweep_you_done)
+                anim.finished.connect(sweep_you_done)
 
         if trace.sweep_opp > 0:
-            start = self._center_for_widget(self.opp_buttons_by_index[3])
-            end = self._center_for_widget(self.opp_store)
-            token = self._create_token(start, 20, f"x{trace.sweep_opp}", "SeedBundle")
-            anim = QPropertyAnimation(token, b"pos")
-            anim.setDuration(400)
-            anim.setStartValue(start - QPoint(10, 10))
-            anim.setEndValue(end - QPoint(10, 10))
-            anim.setEasingCurve(QEasingCurve.InOutQuad)
-            group.addAnimation(anim)
+            start_widget = self.opp_buttons_by_index[3]
+            if start_widget is not None:
+                start = self._center_for_widget(start_widget)
+                end = self._center_for_widget(self.opp_store)
+                token = self._create_token(start, 20, f"x{trace.sweep_opp}", "SeedBundle")
+                anim = QPropertyAnimation(token, b"pos")
+                anim.setDuration(400)
+                anim.setStartValue(start - QPoint(10, 10))
+                anim.setEndValue(end - QPoint(10, 10))
+                anim.setEasingCurve(QEasingCurve.InOutQuad)
+                group.addAnimation(anim)
 
-            def sweep_opp_done() -> None:
-                token.deleteLater()
-                if settings.show_step:
-                    self._apply_sweep_counts(0, trace.sweep_opp)
-                self._flash_widget_quick(self.opp_store, 120)
+                def sweep_opp_done() -> None:
+                    token.deleteLater()
+                    if settings.show_step:
+                        self._apply_sweep_counts(0, trace.sweep_opp)
+                    self._flash_widget_quick(self.opp_store, 120)
 
-            anim.finished.connect(sweep_opp_done)
+                anim.finished.connect(sweep_opp_done)
 
         label = QLabel("GAME OVER", self.overlay)
         label.setObjectName("GameOverLabel")
@@ -1048,6 +1083,9 @@ class MancalaWindow(QMainWindow):
         group.addAnimation(pause)
 
     def schedule_solve_if_needed(self) -> None:
+        if self.closing:
+            self.solving = False
+            return
         if self.animating or is_terminal(self.state) or self.state.to_move != YOU:
             self.solving = False
             self.update_recommendations()
@@ -1065,6 +1103,8 @@ class MancalaWindow(QMainWindow):
         self.update_status()
 
     def _start_solve_for(self, state: State) -> None:
+        if self.closing:
+            return
         self.solve_request_id += 1
         self.solve_target_state = state
         self.deferred_result = None
@@ -1074,6 +1114,8 @@ class MancalaWindow(QMainWindow):
 
     @Slot(int, object)
     def on_solve_result(self, request_id: int, result: object) -> None:
+        if self.closing:
+            return
         if request_id != self.solve_request_id:
             return
         move, eval_score, top_moves = result
@@ -1100,7 +1142,9 @@ class MancalaWindow(QMainWindow):
         for idx, button in enumerate(self.opp_buttons_by_index):
             self._set_pit_text(button, pits_opp[idx])
 
-    def _set_pit_text(self, button: PitButton, count: int) -> None:
+    def _set_pit_text(self, button: Optional[PitButton], count: int) -> None:
+        if button is None:
+            return
         if self.show_numbers_check.isChecked():
             button.setText(f"{button.pit_num}\n{count:02d}")
         else:
@@ -1166,6 +1210,8 @@ class MancalaWindow(QMainWindow):
         for idx, button in enumerate(self.you_buttons_by_index):
             count = pits_you[idx]
             self._set_pit_text(button, count)
+            if button is None:
+                continue
             enabled = (
                 not self.animating
                 and self.state.to_move == YOU
@@ -1177,6 +1223,8 @@ class MancalaWindow(QMainWindow):
         for idx, button in enumerate(self.opp_buttons_by_index):
             count = pits_opp[idx]
             self._set_pit_text(button, count)
+            if button is None:
+                continue
             enabled = (
                 not self.animating
                 and self.state.to_move == OPP
@@ -1187,12 +1235,15 @@ class MancalaWindow(QMainWindow):
 
     def update_recommendations(self) -> None:
         for button in self.you_buttons_by_index:
-            button.set_recommended(False)
+            if button is not None:
+                button.set_recommended(False)
 
         if not self.animating and self.state.to_move == YOU and self.current_best_move is not None:
             idx = self.current_best_move - 1
             if 0 <= idx < 6:
-                self.you_buttons_by_index[idx].set_recommended(True)
+                button = self.you_buttons_by_index[idx]
+                if button is not None:
+                    button.set_recommended(True)
 
         if is_terminal(self.state):
             self.top_moves_label.setText("Top moves: -")
@@ -1264,16 +1315,33 @@ class MancalaWindow(QMainWindow):
     def _format_drop_location(self, drop: DropLocation) -> str:
         if drop.side == "STORE":
             return "YOUR STORE" if drop.store == YOU else "OPP STORE"
-        pit_num = (drop.index or 0) + 1
+        if drop.index is None:
+            return f"{drop.side} pit ?"
+        pit_num = drop.index + 1
         return f"{drop.side} pit {pit_num}"
 
     def closeEvent(self, event) -> None:
-        cache_snapshot = self.solver_worker.try_snapshot_cache()
-        if cache_snapshot is not None:
-            save_tt(cache_snapshot, self.cache_path)
+        self.closing = True
+        self.solving = False
+        self.solve_request_id += 1
+        if self.anim_group is not None:
+            try:
+                self.anim_group.finished.disconnect()
+            except (RuntimeError, TypeError):
+                pass
+            self.anim_group.stop()
+            self.anim_group.deleteLater()
+            self.anim_group = None
+        try:
+            self.solve_requested.disconnect(self.solver_worker.solve)
+        except (RuntimeError, TypeError):
+            pass
         self.solver_thread.requestInterruption()
         self.solver_thread.quit()
-        self.solver_thread.wait(0)
+        if not self.solver_thread.wait(3000):
+            self.solver_thread.wait()
+        cache_snapshot = self.solver_worker.snapshot_cache()
+        save_tt(cache_snapshot, self.cache_path)
         super().closeEvent(event)
 
     def resizeEvent(self, event) -> None:
