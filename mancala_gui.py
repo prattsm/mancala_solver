@@ -237,6 +237,8 @@ class MancalaWindow(QMainWindow):
         self.slice_hide_token = 0
         self.active_start_depth = 1
         self.search_heartbeat_phase = 0
+        self.last_best_update_time: Optional[float] = None
+        self.panel_snapshot_key: Optional[Tuple[str, str]] = None
 
         self.anim_counts_you: Optional[List[int]] = None
         self.anim_counts_opp: Optional[List[int]] = None
@@ -256,7 +258,7 @@ class MancalaWindow(QMainWindow):
         self._build_ui()
         self._setup_solver()
         self.slice_progress_timer = QTimer(self)
-        self.slice_progress_timer.setInterval(100)
+        self.slice_progress_timer.setInterval(200)
         self.slice_progress_timer.timeout.connect(self._update_slice_progress_bar)
         self._apply_style()
 
@@ -386,6 +388,35 @@ class MancalaWindow(QMainWindow):
 
         side_panel.addWidget(self.anim_panel)
 
+        solver_header = QLabel("Solver")
+        solver_header.setObjectName("SideHeader")
+        side_panel.addWidget(solver_header)
+
+        self.solve_state_label = QLabel("State: Idle")
+        self.solve_state_label.setObjectName("SolveState")
+        self.solve_state_label.setWordWrap(True)
+        side_panel.addWidget(self.solve_state_label)
+
+        self.solve_best_label = QLabel("Best: -")
+        self.solve_best_label.setObjectName("SolveBest")
+        self.solve_best_label.setWordWrap(True)
+        side_panel.addWidget(self.solve_best_label)
+
+        self.solve_depth_label = QLabel("Depth: 0 complete")
+        self.solve_depth_label.setObjectName("SolveDepth")
+        self.solve_depth_label.setWordWrap(True)
+        side_panel.addWidget(self.solve_depth_label)
+
+        self.solve_age_label = QLabel("Last best update: -")
+        self.solve_age_label.setObjectName("SolveAge")
+        self.solve_age_label.setWordWrap(True)
+        side_panel.addWidget(self.solve_age_label)
+
+        self.solve_metrics_label = QLabel("Nodes 0 | NPS 0/s | Elapsed 0.0s")
+        self.solve_metrics_label.setObjectName("SolveMetrics")
+        self.solve_metrics_label.setWordWrap(True)
+        side_panel.addWidget(self.solve_metrics_label)
+
         self.slice_progress_label = QLabel("Slice: -")
         self.slice_progress_label.setObjectName("SliceProgress")
         self.slice_progress_label.hide()
@@ -395,7 +426,7 @@ class MancalaWindow(QMainWindow):
         self.slice_progress.setRange(0, SOLVE_SLICE_MS)
         self.slice_progress.setValue(0)
         self.slice_progress.setTextVisible(False)
-        self.slice_progress.setFixedHeight(8)
+        self.slice_progress.setFixedHeight(12)
         self.slice_progress.hide()
         side_panel.addWidget(self.slice_progress)
 
@@ -407,11 +438,6 @@ class MancalaWindow(QMainWindow):
         self.top_moves_label.setObjectName("TopMoves")
         self.top_moves_label.setWordWrap(True)
         side_panel.addWidget(self.top_moves_label)
-
-        self.status_label = QLabel("Status: -")
-        self.status_label.setObjectName("Status")
-        self.status_label.setWordWrap(True)
-        side_panel.addWidget(self.status_label)
 
         side_panel.addStretch(1)
 
@@ -520,9 +546,13 @@ class MancalaWindow(QMainWindow):
             }
             QLabel { color: #f7f3ea; }
             QLabel#SideHeader { font-weight: 600; margin-top: 8px; }
-            QLabel#Status { padding-top: 6px; }
             QLabel#TopMoves { color: #f0e6d6; }
-            QLabel#SliceProgress { color: #e9ddc8; font-size: 10px; }
+            QLabel#SolveState { color: #f2e8d7; font-weight: 600; }
+            QLabel#SolveBest { color: #f6efdf; }
+            QLabel#SolveDepth { color: #e9ddc8; }
+            QLabel#SolveAge { color: #dbc8a8; font-size: 10px; }
+            QLabel#SolveMetrics { color: #d8ccb9; font-size: 10px; }
+            QLabel#SliceProgress { color: #e9ddc8; font-size: 10px; font-weight: 600; }
             QFrame#SidePanel {
                 background: rgba(15, 28, 20, 0.35);
                 border: 1px solid rgba(255, 255, 255, 0.08);
@@ -656,6 +686,8 @@ class MancalaWindow(QMainWindow):
         self.deferred_result = None
         self.deferred_result_state = None
         self.search_progress = None
+        self.last_best_update_time = None
+        self.panel_snapshot_key = None
         self.solve_request_id += 1
         self._set_latest_request_id()
         self.solving = False
@@ -688,6 +720,8 @@ class MancalaWindow(QMainWindow):
         self.deferred_result = None
         self.deferred_result_state = None
         self.search_progress = None
+        self.last_best_update_time = None
+        self.panel_snapshot_key = None
         self.solve_request_id += 1
         self._set_latest_request_id()
         self.solving = False
@@ -757,6 +791,8 @@ class MancalaWindow(QMainWindow):
         self.deferred_result = None
         self.deferred_result_state = None
         self.search_progress = None
+        self.last_best_update_time = None
+        self.panel_snapshot_key = None
         self.solving = False
         self.solve_request_id += 1
         self._set_latest_request_id()
@@ -1311,16 +1347,28 @@ class MancalaWindow(QMainWindow):
         self.deferred_result_state = None
         if not preserve_progress:
             self.search_progress = None
+            self.last_best_update_time = None
+            self.panel_snapshot_key = None
         self.solving = True
         self.active_start_depth = max(1, start_depth)
         self._start_slice_progress()
         self.solve_requested.emit(state, self.topn, self.solve_request_id, start_depth, guess_score)
 
     def _apply_search_result(self, result: SearchResult) -> None:
+        prev = self.search_progress
         self.search_progress = result
         self.current_best_move = result.best_move
         self.current_best_eval = result.score
         self.current_top_moves = list(result.top_moves)
+        if result.best_move is not None:
+            if (
+                prev is None
+                or result.depth != prev.depth
+                or result.best_move != prev.best_move
+                or result.score != prev.score
+            ):
+                self.last_best_update_time = time.perf_counter()
+        self.panel_snapshot_key = None
 
     @Slot(int, object)
     def on_solve_progress(self, request_id: int, result: object) -> None:
@@ -1516,23 +1564,23 @@ class MancalaWindow(QMainWindow):
             if self.search_progress.best_move is not None:
                 best_text = f"pit {self.search_progress.best_move} ({self.search_progress.score:+d})"
 
+        turn_text = "Game over" if is_terminal(self.state) else ("Your turn" if self.state.to_move == YOU else "Opponent turn")
+
         if is_terminal(self.state):
-            primary = "Game over"
-            turn_text = "Game over"
+            state_text = "State: Game over"
             solved = True
             if best_text == "-":
                 best_text = f"diff {final_diff(self.state):+d}"
         else:
-            turn_text = "Your turn" if self.state.to_move == YOU else "Opponent turn"
             if solved:
-                primary = "Solved (perfect)"
+                state_text = f"State: Solved (perfect) | Turn: {turn_text}"
             elif self.solving and self.state.to_move == YOU:
                 dots = "." * self.search_heartbeat_phase
-                primary = f"Searching (best so far){dots}"
+                state_text = f"State: Searching (best so far){dots} | Turn: {turn_text}"
             elif self.search_progress is not None and self.state.to_move == YOU:
-                primary = "Best so far"
+                state_text = f"State: Best so far | Turn: {turn_text}"
             else:
-                primary = "Idle"
+                state_text = f"State: Idle | Turn: {turn_text}"
 
         if self.solving and self.state.to_move == YOU and not solved:
             if self.search_progress is None:
@@ -1540,20 +1588,31 @@ class MancalaWindow(QMainWindow):
             else:
                 probe_depth = max(self.active_start_depth, completed_depth + 1)
 
-        depth_text = f"{completed_depth} complete"
+        depth_text = f"Depth: {completed_depth} complete"
         if probe_depth is not None:
             depth_text += f", probing {probe_depth}"
+
+        best_line = f"Best: {best_text}"
+        panel_key = (best_line, depth_text)
+        if panel_key != self.panel_snapshot_key:
+            self.panel_snapshot_key = panel_key
+            self.solve_best_label.setText(best_line)
+            self.solve_depth_label.setText(depth_text)
 
         nps = 0
         if elapsed_ms > 0:
             nps = int(nodes * 1000 / elapsed_ms)
         elapsed_s = elapsed_ms / 1000.0
-        solved_text = "perfect" if solved else "provisional"
+        self.solve_state_label.setText(state_text)
 
-        self.status_label.setText(
-            f"{primary} | Turn: {turn_text} | Depth: {depth_text} | Best: {best_text} | "
-            f"Nodes: {self._format_nodes(nodes)} | NPS: {self._format_nodes(nps)}/s | "
-            f"Elapsed: {elapsed_s:.1f}s | {solved_text}"
+        if self.last_best_update_time is None:
+            self.solve_age_label.setText("Last best update: -")
+        else:
+            age_s = max(0.0, time.perf_counter() - self.last_best_update_time)
+            self.solve_age_label.setText(f"Last best update: {age_s:.1f}s ago")
+
+        self.solve_metrics_label.setText(
+            f"Nodes {self._format_nodes(nodes)} | NPS {self._format_nodes(nps)}/s | Elapsed {elapsed_s:.1f}s"
         )
 
     def _format_drop_location(self, drop: DropLocation) -> str:
