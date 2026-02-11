@@ -25,6 +25,7 @@ TT_MAX_ENTRIES = 1_000_000
 TT_PRUNE_TO = 800_000
 ASPIRATION_WINDOW_INIT = 4
 ASPIRATION_MAX_RETRIES = 5
+INTERRUPT_POLL_MASK = 0xFF
 
 EXACT = 0
 LOWER = 1
@@ -272,7 +273,11 @@ def ordered_children(state: State, tt: Dict[State, TTEntry]) -> List[Tuple[int, 
 
 
 def _check_deadline(context: _SearchContext) -> None:
-    if context.interrupt_check is not None and context.interrupt_check():
+    if (
+        context.interrupt_check is not None
+        and (context.nodes & INTERRUPT_POLL_MASK) == 0
+        and context.interrupt_check()
+    ):
         raise SearchTimeout()
     if context.deadline is not None and time.perf_counter() >= context.deadline:
         raise SearchTimeout()

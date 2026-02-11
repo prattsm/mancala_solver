@@ -96,12 +96,10 @@ class SolverWorker(QObject):
         super().__init__()
         self.tt = {}
         self.tt_lock = threading.Lock()
-        self.request_lock = threading.Lock()
         self.latest_request_id = 0
 
     def set_latest_request_id(self, request_id: int) -> None:
-        with self.request_lock:
-            self.latest_request_id = request_id
+        self.latest_request_id = request_id
 
     @Slot(object, int, int, int, object)
     def solve(
@@ -115,8 +113,7 @@ class SolverWorker(QObject):
         def _is_interrupted() -> bool:
             if QThread.currentThread().isInterruptionRequested():
                 return True
-            with self.request_lock:
-                return request_id != self.latest_request_id
+            return request_id != self.latest_request_id
 
         if _is_interrupted():
             return
@@ -132,7 +129,7 @@ class SolverWorker(QObject):
                     state,
                     topn=topn,
                     tt=self.tt,
-                    time_limit_ms=300,
+                    time_limit_ms=SOLVE_SLICE_MS,
                     progress_callback=_on_progress,
                     start_depth=start_depth,
                     guess_score=guess_score,
