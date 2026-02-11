@@ -5,6 +5,7 @@ from __future__ import annotations
 import sys
 import threading
 import time
+import traceback
 from dataclasses import dataclass
 from pathlib import Path
 from typing import List, Optional, Tuple
@@ -92,6 +93,7 @@ class SolverWorker(QObject):
     result_ready = Signal(int, object)
     progress = Signal(int, object)
     live_metrics = Signal(int, int, int)
+    solve_failed = Signal(int, str)
 
     def __init__(self) -> None:
         super().__init__()
@@ -143,6 +145,12 @@ class SolverWorker(QObject):
                     live_callback=_on_live,
                 )
         except InterruptedError:
+            return
+        except Exception as exc:
+            traceback.print_exc()
+            if _is_interrupted():
+                return
+            self.solve_failed.emit(request_id, f"{type(exc).__name__}: {exc}")
             return
 
         if _is_interrupted():
@@ -246,6 +254,7 @@ class MancalaWindow(QMainWindow):
         self.search_heartbeat_phase = 0
         self.last_best_update_time: Optional[float] = None
         self.panel_snapshot_key: Optional[Tuple[str, str]] = None
+        self.solver_error_text: Optional[str] = None
         self.live_nodes = 0
         self.live_elapsed_ms = 0
 
@@ -470,6 +479,7 @@ class MancalaWindow(QMainWindow):
         self.solver_worker.progress.connect(self.on_solve_progress)
         self.solver_worker.live_metrics.connect(self.on_solve_live)
         self.solver_worker.result_ready.connect(self.on_solve_result)
+        self.solver_worker.solve_failed.connect(self.on_solve_failed)
         self.solver_thread.start()
 
     def _set_latest_request_id(self) -> None:
@@ -698,6 +708,7 @@ class MancalaWindow(QMainWindow):
         self.search_progress = None
         self.last_best_update_time = None
         self.panel_snapshot_key = None
+        self.solver_error_text = None
         self.live_nodes = 0
         self.live_elapsed_ms = 0
         self.solve_request_id += 1
@@ -734,6 +745,7 @@ class MancalaWindow(QMainWindow):
         self.search_progress = None
         self.last_best_update_time = None
         self.panel_snapshot_key = None
+        self.solver_error_text = None
         self.live_nodes = 0
         self.live_elapsed_ms = 0
         self.solve_request_id += 1
@@ -807,6 +819,7 @@ class MancalaWindow(QMainWindow):
         self.search_progress = None
         self.last_best_update_time = None
         self.panel_snapshot_key = None
+        self.solver_error_text = None
         self.live_nodes = 0
         self.live_elapsed_ms = 0
         self.solving = False
@@ -835,11 +848,14 @@ class MancalaWindow(QMainWindow):
         self._clear_anim_counts()
         self.animating = False
         if self.deferred_result_state == self.state and self.deferred_result is not None:
-            self._apply_search_result(self.deferred_result)
+            deferred_result = self.deferred_result
+            self._apply_search_result(deferred_result)
             self.deferred_result = None
             self.deferred_result_state = None
             self.refresh_ui()
             self._maybe_autoplay(self.solve_request_id)
+            if self._should_requeue_result(deferred_result):
+                self._queue_requeue_solve()
             return
         self.refresh_ui()
         self.schedule_solve_if_needed()
@@ -1346,6 +1362,16 @@ class MancalaWindow(QMainWindow):
         self.update_recommendations()
         self.update_status()
 
+    def _should_requeue_result(self, result: SearchResult) -> bool:
+        return (
+            not self.closing
+            and not result.complete
+            and not self.animating
+            and self.state.to_move == YOU
+            and not is_terminal(self.state)
+            and self.solve_target_state == self.state
+        )
+
     def _start_solve_for(
         self,
         state: State,
@@ -1365,6 +1391,7 @@ class MancalaWindow(QMainWindow):
             self.search_progress = None
             self.last_best_update_time = None
             self.panel_snapshot_key = None
+            self.solver_error_text = None
             self.live_nodes = 0
             self.live_elapsed_ms = 0
         self.solving = True
@@ -1380,6 +1407,7 @@ class MancalaWindow(QMainWindow):
         self.current_top_moves = list(result.top_moves)
         self.live_nodes = result.nodes
         self.live_elapsed_ms = result.elapsed_ms
+        self.solver_error_text = None
         if result.best_move is not None:
             if (
                 prev is None
@@ -1445,8 +1473,29 @@ class MancalaWindow(QMainWindow):
         self.update_recommendations()
         self.update_status()
         self._maybe_autoplay(request_id)
-        if not result.complete:
+        if self._should_requeue_result(result):
             self._queue_requeue_solve()
+
+    @Slot(int, str)
+    def on_solve_failed(self, request_id: int, error_text: str) -> None:
+        if self.closing:
+            return
+        if request_id != self.solve_request_id:
+            return
+        self.solving = False
+        self.requeue_pending = False
+        self._finish_slice_progress(hide_after_ms=180)
+        self.search_progress = None
+        self.current_best_move = None
+        self.current_best_eval = None
+        self.current_top_moves = []
+        self.last_best_update_time = None
+        self.panel_snapshot_key = None
+        self.live_nodes = 0
+        self.live_elapsed_ms = 0
+        self.solver_error_text = error_text
+        self.update_recommendations()
+        self.update_status()
 
     def update_pit_labels(self) -> None:
         pits_you, pits_opp, _, _ = self._display_counts()
@@ -1610,7 +1659,9 @@ class MancalaWindow(QMainWindow):
             if best_text == "-":
                 best_text = f"diff {final_diff(self.state):+d}"
         else:
-            if solved:
+            if self.solver_error_text is not None and not self.solving:
+                state_text = f"State: Solver error (see logs) | Turn: {turn_text}"
+            elif solved:
                 state_text = f"State: Solved (perfect) | Turn: {turn_text}"
             elif self.solving and self.state.to_move == YOU:
                 dots = "." * self.search_heartbeat_phase
@@ -1685,10 +1736,13 @@ class MancalaWindow(QMainWindow):
             pass
         self.solver_thread.requestInterruption()
         self.solver_thread.quit()
-        if not self.solver_thread.wait(3000):
-            self.solver_thread.wait()
-        cache_snapshot = self.solver_worker.snapshot_cache()
-        save_tt(cache_snapshot, self.cache_path)
+        stopped = self.solver_thread.wait(3000)
+        if not stopped:
+            self.solver_thread.terminate()
+            self.solver_thread.wait(500)
+        cache_snapshot = self.solver_worker.try_snapshot_cache()
+        if cache_snapshot is not None:
+            save_tt(cache_snapshot, self.cache_path)
         super().closeEvent(event)
 
     def resizeEvent(self, event) -> None:
