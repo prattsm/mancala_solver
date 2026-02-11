@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import sys
 import threading
+import time
 from dataclasses import dataclass
 from pathlib import Path
 from typing import List, Optional, Tuple
@@ -35,6 +36,7 @@ from PySide6.QtWidgets import (
     QMainWindow,
     QPushButton,
     QRadioButton,
+    QProgressBar,
     QSpinBox,
     QToolButton,
     QVBoxLayout,
@@ -55,6 +57,9 @@ from mancala_engine import (
     legal_moves,
 )
 from mancala_solver import SearchResult, default_cache_path, load_tt, save_tt, solve_best_move
+
+SOLVE_SLICE_MS = 300
+SOLVE_REQUEUE_DELAY_MS = 50
 
 
 @dataclass
@@ -91,6 +96,12 @@ class SolverWorker(QObject):
         super().__init__()
         self.tt = {}
         self.tt_lock = threading.Lock()
+        self.request_lock = threading.Lock()
+        self.latest_request_id = 0
+
+    def set_latest_request_id(self, request_id: int) -> None:
+        with self.request_lock:
+            self.latest_request_id = request_id
 
     @Slot(object, int, int, int, object)
     def solve(
@@ -101,11 +112,17 @@ class SolverWorker(QObject):
         start_depth: int,
         guess_score: Optional[int],
     ) -> None:
-        if QThread.currentThread().isInterruptionRequested():
+        def _is_interrupted() -> bool:
+            if QThread.currentThread().isInterruptionRequested():
+                return True
+            with self.request_lock:
+                return request_id != self.latest_request_id
+
+        if _is_interrupted():
             return
 
         def _on_progress(result: SearchResult) -> None:
-            if QThread.currentThread().isInterruptionRequested():
+            if _is_interrupted():
                 raise InterruptedError()
             self.progress.emit(request_id, result)
 
@@ -119,11 +136,12 @@ class SolverWorker(QObject):
                     progress_callback=_on_progress,
                     start_depth=start_depth,
                     guess_score=guess_score,
+                    interrupt_check=_is_interrupted,
                 )
         except InterruptedError:
             return
 
-        if QThread.currentThread().isInterruptionRequested():
+        if _is_interrupted():
             return
         self.result_ready.emit(request_id, result)
 
@@ -217,6 +235,9 @@ class MancalaWindow(QMainWindow):
         self.solving = False
         self.animating = False
         self.closing = False
+        self.requeue_pending = False
+        self.slice_start_time: Optional[float] = None
+        self.slice_hide_token = 0
 
         self.anim_counts_you: Optional[List[int]] = None
         self.anim_counts_opp: Optional[List[int]] = None
@@ -235,6 +256,9 @@ class MancalaWindow(QMainWindow):
 
         self._build_ui()
         self._setup_solver()
+        self.slice_progress_timer = QTimer(self)
+        self.slice_progress_timer.setInterval(33)
+        self.slice_progress_timer.timeout.connect(self._update_slice_progress_bar)
         self._apply_style()
 
         self.reset_game()
@@ -363,6 +387,14 @@ class MancalaWindow(QMainWindow):
 
         side_panel.addWidget(self.anim_panel)
 
+        self.slice_progress = QProgressBar()
+        self.slice_progress.setRange(0, SOLVE_SLICE_MS)
+        self.slice_progress.setValue(0)
+        self.slice_progress.setTextVisible(False)
+        self.slice_progress.setFixedHeight(8)
+        self.slice_progress.hide()
+        side_panel.addWidget(self.slice_progress)
+
         self.top_moves_label = QLabel("Top moves: -")
         self.top_moves_label.setObjectName("TopMoves")
         self.top_moves_label.setWordWrap(True)
@@ -388,12 +420,64 @@ class MancalaWindow(QMainWindow):
     def _setup_solver(self) -> None:
         self.solver_thread = QThread(self)
         self.solver_worker = SolverWorker()
+        self.solver_worker.set_latest_request_id(self.solve_request_id)
         self.solver_worker.set_cache(load_tt(self.cache_path))
         self.solver_worker.moveToThread(self.solver_thread)
         self.solve_requested.connect(self.solver_worker.solve)
         self.solver_worker.progress.connect(self.on_solve_progress)
         self.solver_worker.result_ready.connect(self.on_solve_result)
         self.solver_thread.start()
+
+    def _set_latest_request_id(self) -> None:
+        if hasattr(self, "solver_worker"):
+            self.solver_worker.set_latest_request_id(self.solve_request_id)
+
+    def _start_slice_progress(self) -> None:
+        self.slice_hide_token += 1
+        self.slice_start_time = time.perf_counter()
+        self.slice_progress.setRange(0, SOLVE_SLICE_MS)
+        self.slice_progress.setValue(0)
+        self.slice_progress.show()
+        if not self.slice_progress_timer.isActive():
+            self.slice_progress_timer.start()
+
+    def _update_slice_progress_bar(self) -> None:
+        if self.slice_start_time is None:
+            return
+        elapsed_ms = int((time.perf_counter() - self.slice_start_time) * 1000)
+        self.slice_progress.setValue(min(SOLVE_SLICE_MS, max(0, elapsed_ms)))
+
+    def _finish_slice_progress(self, hide_after_ms: Optional[int] = None) -> None:
+        self.slice_start_time = None
+        self.slice_progress_timer.stop()
+        self.slice_progress.setValue(SOLVE_SLICE_MS)
+        if hide_after_ms is None:
+            return
+        token = self.slice_hide_token
+        QTimer.singleShot(hide_after_ms, lambda: self._hide_slice_progress_if_idle(token))
+
+    def _hide_slice_progress_if_idle(self, token: int) -> None:
+        if token != self.slice_hide_token:
+            return
+        if self.solving:
+            return
+        if self.animating or self.state.to_move != YOU:
+            self.slice_progress.hide()
+            return
+        if self.search_progress is None or self.search_progress.complete:
+            self.slice_progress.hide()
+
+    def _queue_requeue_solve(self) -> None:
+        if self.closing or self.requeue_pending:
+            return
+        self.requeue_pending = True
+        QTimer.singleShot(SOLVE_REQUEUE_DELAY_MS, self._run_requeue_solve)
+
+    def _run_requeue_solve(self) -> None:
+        self.requeue_pending = False
+        if self.closing:
+            return
+        self.schedule_solve_if_needed()
 
     def _apply_style(self) -> None:
         app = QApplication.instance()
@@ -474,6 +558,15 @@ class MancalaWindow(QMainWindow):
                 border-radius: 6px;
                 padding: 4px 6px;
             }
+            QProgressBar {
+                border: 1px solid rgba(255, 255, 255, 0.2);
+                border-radius: 4px;
+                background: rgba(15, 28, 20, 0.35);
+            }
+            QProgressBar::chunk {
+                background: #d9ba7a;
+                border-radius: 3px;
+            }
             QLabel#SeedToken {
                 background: #f7e9c8;
                 border: 1px solid #b08a5a;
@@ -536,7 +629,12 @@ class MancalaWindow(QMainWindow):
         self.deferred_result_state = None
         self.search_progress = None
         self.solve_request_id += 1
+        self._set_latest_request_id()
         self.solving = False
+        self.requeue_pending = False
+        self.slice_progress.hide()
+        self.slice_progress_timer.stop()
+        self.slice_start_time = None
         self._clear_anim_counts()
         self.refresh_ui()
         self.schedule_solve_if_needed()
@@ -562,7 +660,12 @@ class MancalaWindow(QMainWindow):
         self.deferred_result_state = None
         self.search_progress = None
         self.solve_request_id += 1
+        self._set_latest_request_id()
         self.solving = False
+        self.requeue_pending = False
+        self.slice_progress.hide()
+        self.slice_progress_timer.stop()
+        self.slice_start_time = None
         self._clear_anim_counts()
         self.refresh_ui()
         self.schedule_solve_if_needed()
@@ -626,6 +729,11 @@ class MancalaWindow(QMainWindow):
         self.search_progress = None
         self.solving = False
         self.solve_request_id += 1
+        self._set_latest_request_id()
+        self.requeue_pending = False
+        self.slice_progress.hide()
+        self.slice_progress_timer.stop()
+        self.slice_start_time = None
 
         if self.animate_check.isChecked():
             self.start_animation()
@@ -1113,9 +1221,12 @@ class MancalaWindow(QMainWindow):
     def schedule_solve_if_needed(self) -> None:
         if self.closing:
             self.solving = False
+            self.requeue_pending = False
             return
         if self.animating or is_terminal(self.state) or self.state.to_move != YOU:
             self.solving = False
+            self.requeue_pending = False
+            self._finish_slice_progress(hide_after_ms=120)
             self.update_recommendations()
             self.update_status()
             return
@@ -1126,6 +1237,8 @@ class MancalaWindow(QMainWindow):
             and not self.solving
             and (self.search_progress is None or self.search_progress.complete)
         ):
+            self.requeue_pending = False
+            self._finish_slice_progress(hide_after_ms=120)
             self.update_recommendations()
             self.update_status()
             return
@@ -1159,13 +1272,16 @@ class MancalaWindow(QMainWindow):
     ) -> None:
         if self.closing:
             return
+        self.requeue_pending = False
         self.solve_request_id += 1
+        self._set_latest_request_id()
         self.solve_target_state = state
         self.deferred_result = None
         self.deferred_result_state = None
         if not preserve_progress:
             self.search_progress = None
         self.solving = True
+        self._start_slice_progress()
         self.solve_requested.emit(state, self.topn, self.solve_request_id, start_depth, guess_score)
 
     def _apply_search_result(self, result: SearchResult) -> None:
@@ -1199,6 +1315,10 @@ class MancalaWindow(QMainWindow):
         if not isinstance(result, SearchResult):
             return
         self.solving = False
+        hide_after_ms: Optional[int] = None
+        if result.complete or self.animating or self.state.to_move != YOU:
+            hide_after_ms = 180
+        self._finish_slice_progress(hide_after_ms=hide_after_ms)
         if self.animating and self.pending_state is not None and self.solve_target_state == self.pending_state:
             self.deferred_result = result
             self.deferred_result_state = self.pending_state
@@ -1212,7 +1332,7 @@ class MancalaWindow(QMainWindow):
         self.update_status()
         self._maybe_autoplay(request_id)
         if not result.complete:
-            QTimer.singleShot(0, self.schedule_solve_if_needed)
+            self._queue_requeue_solve()
 
     def update_pit_labels(self) -> None:
         pits_you, pits_opp, _, _ = self._display_counts()
@@ -1330,23 +1450,12 @@ class MancalaWindow(QMainWindow):
             return
 
         if self.animating:
-            self.top_moves_label.setText("Top moves: animating...")
+            self.top_moves_label.setText("Top moves: -")
             self.play_best_button.setEnabled(False)
             return
 
         if self.state.to_move != YOU:
-            self.top_moves_label.setText("Top moves: waiting for opponent")
-            self.play_best_button.setEnabled(False)
-            return
-
-        if self.solving:
-            if self.search_progress is not None and self.search_progress.best_move is not None:
-                self.top_moves_label.setText(
-                    f"Top moves: depth {self.search_progress.depth} best so far pit "
-                    f"{self.search_progress.best_move} ({self.search_progress.score:+d})"
-                )
-            else:
-                self.top_moves_label.setText("Top moves: solving...")
+            self.top_moves_label.setText("Top moves: -")
             self.play_best_button.setEnabled(False)
             return
 
@@ -1355,59 +1464,37 @@ class MancalaWindow(QMainWindow):
             self.play_best_button.setEnabled(False)
             return
 
-        parts = []
-        for idx, (move, score) in enumerate(self.current_top_moves):
-            if idx == 0:
-                parts.append(f"Best: pit {move} ({score:+d})")
-            elif idx == 1:
-                parts.append(f"Next: pit {move} ({score:+d})")
-            else:
-                parts.append(f"pit {move} ({score:+d})")
-        self.top_moves_label.setText(" | ".join(parts))
-        self.play_best_button.setEnabled(self.current_best_move is not None and not self.animating)
+        parts = [f"pit {move} ({score:+d})" for move, score in self.current_top_moves]
+        self.top_moves_label.setText(f"Top moves: {' | '.join(parts)}")
+        self.play_best_button.setEnabled(self.current_best_move is not None)
 
     def update_status(self) -> None:
+        depth = 0
+        nodes = 0
+        best_text = "-"
+        completeness = "incomplete"
+
+        if self.search_progress is not None:
+            depth = self.search_progress.depth
+            nodes = self.search_progress.nodes
+            if self.search_progress.best_move is not None:
+                best_text = f"pit {self.search_progress.best_move} ({self.search_progress.score:+d})"
+            completeness = "complete" if self.search_progress.complete else "incomplete"
+
+        if self.solving and completeness != "complete":
+            completeness = "incomplete (searching)"
+
         if is_terminal(self.state):
-            self.status_label.setText(
-                f"Game over. You {self.state.store_you} - Opponent {self.state.store_opp} "
-                f"(diff {final_diff(self.state):+d})"
-            )
-            return
-
-        turn_text = "Your turn" if self.state.to_move == YOU else "Opponent turn"
-        status_parts = [f"Turn: {turn_text}"]
-
-        trace = self.pending_trace if self.animating and self.pending_trace is not None else self.last_trace
-        if trace is not None:
-            landed = self._format_drop_location(trace.last_drop)
-            status_parts.append(f"Moved from: {trace.mover} pit {trace.picked_pit} -> Landed: {landed}")
-            if trace.capture is not None:
-                status_parts.append(
-                    f"Capture: YES (captured {trace.capture.captured_count} from opposite pit)"
-                )
-            else:
-                status_parts.append("Capture: NO")
-            status_parts.append(f"Extra turn: {'YES' if trace.extra_turn else 'NO'}")
+            turn_text = "Game over"
+            completeness = "complete"
+            if best_text == "-":
+                best_text = f"diff {final_diff(self.state):+d}"
         else:
-            status_parts.append(f"Last: {self.last_move_desc}")
+            turn_text = "Your turn" if self.state.to_move == YOU else "Opponent turn"
 
-        if self.animating:
-            status_parts.append("Animating...")
-        if self.state.to_move == YOU and self.search_progress is not None and self.search_progress.best_move is not None:
-            if self.search_progress.complete:
-                status_parts.append(
-                    f"Solved (perfect): pit {self.search_progress.best_move}, "
-                    f"score {self.search_progress.score:+d}"
-                )
-            else:
-                status_parts.append(
-                    f"Searching... depth {self.search_progress.depth} "
-                    f"(best so far: pit {self.search_progress.best_move}, "
-                    f"score {self.search_progress.score:+d})"
-                )
-        elif self.solving and self.state.to_move == YOU:
-            status_parts.append("Searching...")
-        self.status_label.setText(" | ".join(status_parts))
+        self.status_label.setText(
+            f"Turn: {turn_text} | Depth: {depth} | Nodes: {nodes} | Best: {best_text} | {completeness}"
+        )
 
     def _format_drop_location(self, drop: DropLocation) -> str:
         if drop.side == "STORE":
@@ -1420,7 +1507,12 @@ class MancalaWindow(QMainWindow):
     def closeEvent(self, event) -> None:
         self.closing = True
         self.solving = False
+        self.requeue_pending = False
         self.solve_request_id += 1
+        self._set_latest_request_id()
+        self.slice_progress_timer.stop()
+        self.slice_start_time = None
+        self.slice_progress.hide()
         if self.anim_group is not None:
             try:
                 self.anim_group.finished.disconnect()

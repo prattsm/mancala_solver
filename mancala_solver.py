@@ -54,6 +54,7 @@ class SearchResult:
 class _SearchContext:
     tt: Dict[State, TTEntry]
     deadline: Optional[float]
+    interrupt_check: Optional[Callable[[], bool]] = None
     nodes: int = 0
     hit_depth_limit: bool = False
 
@@ -271,6 +272,8 @@ def ordered_children(state: State, tt: Dict[State, TTEntry]) -> List[Tuple[int, 
 
 
 def _check_deadline(context: _SearchContext) -> None:
+    if context.interrupt_check is not None and context.interrupt_check():
+        raise SearchTimeout()
     if context.deadline is not None and time.perf_counter() >= context.deadline:
         raise SearchTimeout()
 
@@ -349,7 +352,7 @@ def search_depth(
     alpha: int = -INF,
     beta: int = INF,
 ) -> int:
-    context = _SearchContext(tt=tt, deadline=None)
+    context = _SearchContext(tt=tt, deadline=None, interrupt_check=None)
     return _search_depth(state, alpha, beta, max(0, depth), context)
 
 
@@ -450,6 +453,7 @@ def solve_best_move(
     progress_callback: Optional[Callable[[SearchResult], None]] = None,
     start_depth: int = 1,
     guess_score: Optional[int] = None,
+    interrupt_check: Optional[Callable[[], bool]] = None,
 ) -> SearchResult:
     if tt is None:
         tt = {}
@@ -468,7 +472,7 @@ def solve_best_move(
         )
 
     if time_limit_ms is None:
-        context = _SearchContext(tt=tt, deadline=None)
+        context = _SearchContext(tt=tt, deadline=None, interrupt_check=interrupt_check)
         depth_result = _best_move_depth(state, topn, FULL_DEPTH, context, -INF, INF)
         elapsed_ms = int((time.perf_counter() - start) * 1000)
         result = SearchResult(
@@ -494,7 +498,7 @@ def solve_best_move(
         if time.perf_counter() >= deadline:
             break
 
-        context = _SearchContext(tt=tt, deadline=deadline)
+        context = _SearchContext(tt=tt, deadline=deadline, interrupt_check=interrupt_check)
         try:
             depth_result = _run_depth_iteration_with_aspiration(
                 state=state,
