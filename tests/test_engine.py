@@ -1,7 +1,10 @@
 import random
+import tempfile
 import unittest
+from pathlib import Path
 
 from mancala_engine import (
+    DropLocation,
     OPP,
     YOU,
     State,
@@ -13,7 +16,18 @@ from mancala_engine import (
     is_terminal,
     legal_moves,
 )
-from mancala_solver import INF, _tt_best_move, ordered_children, search, terminal_diff
+from mancala_solver import (
+    EXACT,
+    INF,
+    TTEntry,
+    _tt_best_move,
+    best_move,
+    load_tt,
+    ordered_children,
+    save_tt,
+    search,
+    terminal_diff,
+)
 
 
 def make_state(to_move, pits_you, pits_opp, store_you=0, store_opp=0):
@@ -31,6 +45,9 @@ class TestEngine(unittest.TestCase):
         new_state = apply_move(state, 6)
         self.assertEqual(new_state.store_opp, 0)
         self.assertEqual(total_seeds(new_state), before_total)
+        info = apply_move_with_info(state, 6)
+        forbidden = DropLocation("STORE", None, OPP)
+        self.assertNotIn(forbidden, info.trace.drops)
 
     def test_skip_your_store_on_opp_move(self):
         state = make_state(OPP, [1, 0, 0, 0, 0, 0], [8, 1, 0, 0, 0, 0])
@@ -38,6 +55,9 @@ class TestEngine(unittest.TestCase):
         new_state = apply_move(state, 1)
         self.assertEqual(new_state.store_you, 0)
         self.assertEqual(total_seeds(new_state), before_total)
+        info = apply_move_with_info(state, 1)
+        forbidden = DropLocation("STORE", None, YOU)
+        self.assertNotIn(forbidden, info.trace.drops)
 
     def test_extra_turn_you(self):
         state = make_state(YOU, [0, 0, 0, 4, 0, 0], [1, 0, 0, 0, 0, 0])
@@ -80,6 +100,21 @@ class TestEngine(unittest.TestCase):
         self.assertTrue(info.capture)
         self.assertIsNotNone(info.trace.capture)
         self.assertEqual(info.trace.capture.opposite_index, 5 - info.trace.capture.landing_index)
+
+    def test_capture_when_opposite_empty_moves_single_seed(self):
+        state = make_state(YOU, [0, 0, 1, 0, 0, 1], [2, 0, 0, 0, 0, 0])
+        info = apply_move_with_info(state, 3)
+        self.assertTrue(info.capture)
+        self.assertEqual(info.state.store_you, 1)
+        self.assertEqual(info.state.pits_you[1], 0)
+        self.assertEqual(info.state.pits_opp[4], 0)
+
+    def test_no_capture_when_last_drop_is_store(self):
+        state = make_state(YOU, [0, 0, 0, 4, 0, 0], [1, 0, 0, 0, 0, 0])
+        info = apply_move_with_info(state, 4)
+        self.assertTrue(info.extra_turn)
+        self.assertFalse(info.capture)
+        self.assertIsNone(info.trace.capture)
 
     def test_terminal_sweep_when_you_empty(self):
         state = make_state(YOU, [1, 0, 0, 0, 0, 0], [2, 2, 2, 2, 2, 2])
@@ -177,6 +212,46 @@ class TestEngine(unittest.TestCase):
             children = ordered_children(state, tt)
             self.assertTrue(children)
 
+    def test_best_move_value_matches_search(self):
+        rng = random.Random(21)
+        tt = {}
+
+        def random_reachable_state():
+            state = initial_state(seeds=2, you_first=bool(rng.getrandbits(1)))
+            plies = rng.randint(0, 20)
+            for _ in range(plies):
+                if is_terminal(state):
+                    break
+                state = apply_move(state, rng.choice(legal_moves(state)))
+            return state
+
+        checked = 0
+        while checked < 8:
+            state = random_reachable_state()
+            if is_terminal(state):
+                continue
+            move, value, _ = best_move(state, tt=tt)
+            self.assertIn(move, legal_moves(state))
+            self.assertEqual(value, search(state, -INF, INF, tt))
+            checked += 1
+
+    def test_best_move_value_matches_search_fresh_tt(self):
+        rng = random.Random(22)
+
+        for _ in range(4):
+            state = initial_state(seeds=2, you_first=bool(rng.getrandbits(1)))
+            plies = rng.randint(0, 16)
+            for _ in range(plies):
+                if is_terminal(state):
+                    break
+                state = apply_move(state, rng.choice(legal_moves(state)))
+            if is_terminal(state):
+                continue
+            tt = {}
+            move, value, _ = best_move(state, tt=tt)
+            self.assertIn(move, legal_moves(state))
+            self.assertEqual(value, search(state, -INF, INF, tt))
+
     def test_terminal_diff_virtual_sweep(self):
         state_you_empty = make_state(YOU, [0, 0, 0, 0, 0, 0], [1, 2, 3, 4, 5, 6], 8, 2)
         self.assertEqual(terminal_diff(state_you_empty), 8 - (2 + 21))
@@ -186,6 +261,19 @@ class TestEngine(unittest.TestCase):
 
         non_terminal = make_state(YOU, [1, 0, 0, 0, 0, 0], [0, 1, 0, 0, 0, 0], 4, 7)
         self.assertEqual(terminal_diff(non_terminal), -3)
+
+    def test_tt_cache_round_trip(self):
+        state_a = make_state(YOU, [1, 2, 3, 4, 5, 6], [6, 5, 4, 3, 2, 1], 7, 8)
+        state_b = make_state(OPP, [0, 1, 0, 2, 0, 3], [3, 0, 2, 0, 1, 0], 4, 9)
+        tt = {
+            state_a: TTEntry(3, EXACT, 4),
+            state_b: TTEntry(-2, EXACT, 1),
+        }
+        with tempfile.TemporaryDirectory() as tmpdir:
+            path = Path(tmpdir) / "cache.pkl.gz"
+            save_tt(tt, path)
+            loaded = load_tt(path)
+        self.assertEqual(loaded, tt)
 
 
 if __name__ == "__main__":
