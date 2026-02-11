@@ -372,9 +372,9 @@ class MancalaWindow(QMainWindow):
         self.anim_toggle = QToolButton()
         self.anim_toggle.setText("Animation")
         self.anim_toggle.setCheckable(True)
-        self.anim_toggle.setChecked(True)
+        self.anim_toggle.setChecked(False)
         self.anim_toggle.setToolButtonStyle(Qt.ToolButtonTextBesideIcon)
-        self.anim_toggle.setArrowType(Qt.DownArrow)
+        self.anim_toggle.setArrowType(Qt.RightArrow)
         self.anim_toggle.toggled.connect(self._toggle_animation_panel)
         side_panel.addWidget(self.anim_toggle)
 
@@ -404,6 +404,7 @@ class MancalaWindow(QMainWindow):
         self.replay_button.clicked.connect(self.replay_last_move)
         anim_layout.addWidget(self.replay_button)
 
+        self.anim_panel.setVisible(False)
         side_panel.addWidget(self.anim_panel)
 
         solver_header = QLabel("Solver")
@@ -1664,8 +1665,7 @@ class MancalaWindow(QMainWindow):
             elif solved:
                 state_text = f"State: Solved (perfect) | Turn: {turn_text}"
             elif self.solving and self.state.to_move == YOU:
-                dots = "." * self.search_heartbeat_phase
-                state_text = f"State: Searching (best so far){dots} | Turn: {turn_text}"
+                state_text = f"State: Searching (best so far) | Turn: {turn_text}"
             elif self.search_progress is not None and self.state.to_move == YOU:
                 state_text = f"State: Best so far | Turn: {turn_text}"
             else:
