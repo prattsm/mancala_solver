@@ -208,7 +208,7 @@ class MancalaWindow(QMainWindow):
         self.solving = False
         self.animating = False
         self.closing = False
-        self.solve_time_limit_ms: Optional[int] = 1200
+        self.solve_time_limit_ms: Optional[int] = 2400
 
         self.anim_counts_you: Optional[List[int]] = None
         self.anim_counts_opp: Optional[List[int]] = None
