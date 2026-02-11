@@ -66,6 +66,9 @@ if HAS_QT:
         def try_snapshot_cache(self):
             return dict(self.cache)
 
+        def close(self) -> None:
+            return
+
 
     def _fake_setup_solver(window: "gui_mod.MancalaWindow") -> None:
         window.solver_thread = _DummyThread()

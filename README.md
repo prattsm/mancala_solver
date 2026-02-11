@@ -18,10 +18,26 @@ Optional flags:
 - `--explain` show evals for top moves
 - `--time-ms N` per-turn search budget in milliseconds (default 300)
 - `--perfect` search to terminal (ignores `--time-ms`)
+- `--telemetry host:port` stream solver telemetry to sidecar visualizer
 
 ## Run (GUI)
 ```bash
 python3 mancala_gui.py
+```
+
+Optional sidecar telemetry stream for GUI solves:
+```bash
+MANCALA_TELEMETRY=127.0.0.1:8765 python3 mancala_gui.py
+```
+
+## Run (Visualizer)
+```bash
+python3 mancala_visualizer.py --listen 127.0.0.1:8765
+```
+
+Demo mode (visualizer drives the solver itself):
+```bash
+python3 mancala_visualizer.py --demo
 ```
 
 ## Tests

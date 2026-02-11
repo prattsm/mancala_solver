@@ -49,7 +49,7 @@ class TestCLI(unittest.TestCase):
         )
         inputs = iter(["y", "q"])
 
-        def fake_solve(state, topn=3, tt=None, time_limit_ms=None):
+        def fake_solve(state, topn=3, tt=None, time_limit_ms=None, **kwargs):
             calls.append(time_limit_ms)
             return fake_result
 
@@ -80,7 +80,7 @@ class TestCLI(unittest.TestCase):
         )
         inputs = iter(["y", "q"])
 
-        def fake_solve(state, topn=3, tt=None, time_limit_ms=None):
+        def fake_solve(state, topn=3, tt=None, time_limit_ms=None, **kwargs):
             calls.append(time_limit_ms)
             return fake_result
 

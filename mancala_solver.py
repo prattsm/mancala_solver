@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Callable, Dict, List, Optional, Tuple
 import gzip
@@ -17,6 +17,16 @@ from mancala_engine import (
     is_terminal,
     legal_moves,
 )
+from mancala_telemetry import (
+    IterationDoneEvent,
+    IterationStartEvent,
+    NodeBatchEvent,
+    PVUpdateEvent,
+    SearchEndEvent,
+    SearchStartEvent,
+    TelemetrySink,
+    emit_dataclass_event,
+)
 
 INF = 10**9
 FULL_DEPTH = 1_000_000
@@ -28,6 +38,9 @@ ASPIRATION_MAX_RETRIES = 5
 INTERRUPT_POLL_MASK = 0xFF
 LIVE_POLL_MASK = 0x3FF
 LIVE_EMIT_INTERVAL_MS = 120
+TELEMETRY_NODE_MASK = 0x3FF
+TELEMETRY_DEPTH_SAMPLE_MASK = 0x7
+TELEMETRY_EMIT_INTERVAL_MS = 120
 
 EXACT = 0
 LOWER = 1
@@ -60,9 +73,37 @@ class _SearchContext:
     deadline: Optional[float]
     interrupt_check: Optional[Callable[[], bool]] = None
     live_nodes_callback: Optional[Callable[[int], None]] = None
+    telemetry: Optional["_TelemetryStats"] = None
+    iter_depth: int = 0
     nodes: int = 0
     hit_depth_limit: bool = False
     used_unproven_tt: bool = False
+    interrupted: bool = False
+
+
+@dataclass
+class _TelemetryStats:
+    sink: TelemetrySink
+    solve_start: float
+    last_emit: float
+    state_key: str
+    nodes_total: int = 0
+    tt_probes: int = 0
+    tt_hits: int = 0
+    tt_stores: int = 0
+    tt_exact_reuse: int = 0
+    tt_bound_reuse: int = 0
+    cutoffs: int = 0
+    cutoff_alpha_beta: int = 0
+    cutoff_tt_bound: int = 0
+    eval_calls: int = 0
+    max_depth: int = 0
+    branching_sum: int = 0
+    branching_samples: int = 0
+    aspiration_window: int = 0
+    aspiration_retries: int = 0
+    depth_hist: Dict[int, int] = field(default_factory=dict)
+    cutoff_hist: Dict[int, int] = field(default_factory=dict)
 
 
 @dataclass(frozen=True)
@@ -72,6 +113,9 @@ class _DepthSearchResult:
     top_moves: List[Tuple[int, int]]
     fail_low: bool
     fail_high: bool
+    root_scores: Tuple[Tuple[int, int], ...] = ()
+    aspiration_window: int = 0
+    aspiration_retries: int = 0
 
 
 class SearchTimeout(Exception):
@@ -297,9 +341,128 @@ def _check_deadline(context: _SearchContext) -> None:
         and (context.nodes & INTERRUPT_POLL_MASK) == 0
         and context.interrupt_check()
     ):
+        context.interrupted = True
         raise SearchTimeout()
     if context.deadline is not None and time.perf_counter() >= context.deadline:
         raise SearchTimeout()
+
+
+def _telemetry_ply(context: _SearchContext, depth_remaining: int) -> int:
+    if context.iter_depth <= 0:
+        return 0
+    return max(0, context.iter_depth - max(0, depth_remaining))
+
+
+def _histogram_payload(hist: Dict[int, int], limit: int = 24) -> Dict[str, int]:
+    items = sorted(hist.items())
+    trimmed = items[:limit]
+    return {str(depth): count for depth, count in trimmed}
+
+
+def _telemetry_record_node(context: _SearchContext, depth_remaining: int) -> None:
+    stats = context.telemetry
+    if stats is None:
+        return
+    stats.nodes_total += 1
+    if (stats.nodes_total & TELEMETRY_DEPTH_SAMPLE_MASK) != 0:
+        return
+    ply = _telemetry_ply(context, depth_remaining)
+    stats.depth_hist[ply] = stats.depth_hist.get(ply, 0) + 1
+    if ply > stats.max_depth:
+        stats.max_depth = ply
+
+
+def _telemetry_record_cutoff(context: _SearchContext, depth_remaining: int, kind: str) -> None:
+    stats = context.telemetry
+    if stats is None:
+        return
+    stats.cutoffs += 1
+    if kind == "alpha_beta":
+        stats.cutoff_alpha_beta += 1
+    else:
+        stats.cutoff_tt_bound += 1
+    ply = _telemetry_ply(context, depth_remaining)
+    stats.cutoff_hist[ply] = stats.cutoff_hist.get(ply, 0) + 1
+
+
+def _telemetry_maybe_emit_batch(context: _SearchContext, force: bool = False) -> None:
+    stats = context.telemetry
+    if stats is None:
+        return
+    if not force and (stats.nodes_total & TELEMETRY_NODE_MASK) != 0:
+        return
+    now = time.perf_counter()
+    if not force and (now - stats.last_emit) * 1000 < TELEMETRY_EMIT_INTERVAL_MS:
+        return
+
+    elapsed_ms = max(1, int((now - stats.solve_start) * 1000))
+    nps = int(stats.nodes_total * 1000 / elapsed_ms)
+    branching = 0.0
+    if stats.branching_samples > 0:
+        branching = stats.branching_sum / stats.branching_samples
+
+    emit_dataclass_event(
+        stats.sink,
+        "node_batch",
+        NodeBatchEvent(
+            nodes_total=stats.nodes_total,
+            nps_estimate=nps,
+            tt_hits=stats.tt_hits,
+            tt_probes=stats.tt_probes,
+            tt_stores=stats.tt_stores,
+            tt_exact_reuse=stats.tt_exact_reuse,
+            tt_bound_reuse=stats.tt_bound_reuse,
+            cutoffs=stats.cutoffs,
+            cutoff_alpha_beta=stats.cutoff_alpha_beta,
+            cutoff_tt_bound=stats.cutoff_tt_bound,
+            eval_calls=stats.eval_calls,
+            max_depth=stats.max_depth,
+            branching_factor_estimate=round(branching, 3),
+            aspiration_window=stats.aspiration_window,
+            aspiration_retries=stats.aspiration_retries,
+            depth_histogram=_histogram_payload(stats.depth_hist),
+            cutoff_depth_histogram=_histogram_payload(stats.cutoff_hist),
+            elapsed_ms=elapsed_ms,
+        ),
+    )
+    stats.last_emit = now
+
+
+def _extract_pv_moves(state: State, tt: Dict[State, TTEntry], max_len: int = 16) -> List[int]:
+    pv: List[int] = []
+    seen: set[State] = set()
+    current = state
+    for _ in range(max_len):
+        if current in seen:
+            break
+        seen.add(current)
+        move = _tt_best_move(current, tt)
+        if move is None:
+            break
+        if move not in legal_moves(current):
+            break
+        pv.append(move)
+        current, _, _ = apply_move_fast_with_info(current, move)
+        if is_terminal(current):
+            break
+    return pv
+
+
+def _decorate_depth_result(
+    outcome: _DepthSearchResult,
+    aspiration_window: int,
+    aspiration_retries: int,
+) -> _DepthSearchResult:
+    return _DepthSearchResult(
+        best_move=outcome.best_move,
+        score=outcome.score,
+        top_moves=outcome.top_moves,
+        fail_low=outcome.fail_low,
+        fail_high=outcome.fail_high,
+        root_scores=outcome.root_scores,
+        aspiration_window=aspiration_window,
+        aspiration_retries=aspiration_retries,
+    )
 
 
 def _search_depth(
@@ -307,6 +470,8 @@ def _search_depth(
 ) -> Tuple[int, bool]:
     _check_deadline(context)
     context.nodes += 1
+    _telemetry_record_node(context, depth)
+    _telemetry_maybe_emit_batch(context)
     if context.live_nodes_callback is not None and (context.nodes & LIVE_POLL_MASK) == 0:
         context.live_nodes_callback(context.nodes)
 
@@ -315,27 +480,41 @@ def _search_depth(
 
     if depth <= 0:
         context.hit_depth_limit = True
+        if context.telemetry is not None:
+            context.telemetry.eval_calls += 1
         return _heuristic_eval(state), False
 
     alpha0, beta0 = alpha, beta
     norm_state, sign = normalize_state(state)
+    if context.telemetry is not None:
+        context.telemetry.tt_probes += 1
     entry = _tt_get(context.tt, norm_state)
     if entry is not None and entry.depth >= depth:
+        if context.telemetry is not None:
+            context.telemetry.tt_hits += 1
         value, flag = denormalize_value_flag(entry.value, entry.flag, sign)
         if not entry.proven:
             context.used_unproven_tt = True
         if flag == EXACT:
+            if context.telemetry is not None:
+                context.telemetry.tt_exact_reuse += 1
             if not entry.proven:
                 context.hit_depth_limit = True
             return value, entry.proven
+        if context.telemetry is not None:
+            context.telemetry.tt_bound_reuse += 1
         if flag == LOWER:
             alpha = max(alpha, value)
         elif flag == UPPER:
             beta = min(beta, value)
         if alpha >= beta:
+            _telemetry_record_cutoff(context, depth, "tt_bound")
             return value, False
 
     children = ordered_children(state, context.tt)
+    if context.telemetry is not None:
+        context.telemetry.branching_sum += len(children)
+        context.telemetry.branching_samples += 1
     if not children:
         return terminal_diff(state), True
 
@@ -351,6 +530,7 @@ def _search_depth(
                 best_proven = val_proven
             alpha = max(alpha, best)
             if alpha >= beta:
+                _telemetry_record_cutoff(context, depth, "alpha_beta")
                 break
     else:
         best = INF
@@ -362,6 +542,7 @@ def _search_depth(
                 best_proven = val_proven
             beta = min(beta, best)
             if alpha >= beta:
+                _telemetry_record_cutoff(context, depth, "alpha_beta")
                 break
 
     if best_move is None:
@@ -377,6 +558,8 @@ def _search_depth(
     value_norm, flag_norm = normalize_value_flag(best, flag, sign)
     best_move_norm = normalize_move(best_move, sign)
     exact_proven = best_proven if flag == EXACT else False
+    if context.telemetry is not None:
+        context.telemetry.tt_stores += 1
     _tt_store(context.tt, norm_state, TTEntry(value_norm, flag_norm, best_move_norm, depth, exact_proven))
     return best, exact_proven
 
@@ -413,6 +596,7 @@ def _best_move_depth(
             top_moves=[],
             fail_low=score <= alpha,
             fail_high=score >= beta,
+            root_scores=(),
         )
 
     scored: List[Tuple[int, int]] = []
@@ -451,6 +635,7 @@ def _best_move_depth(
         top_moves=top_moves,
         fail_low=best_score <= alpha,
         fail_high=best_score >= beta,
+        root_scores=tuple(scored),
     )
 
 
@@ -462,19 +647,30 @@ def _run_depth_iteration_with_aspiration(
     context: _SearchContext,
 ) -> _DepthSearchResult:
     if guess_score is None:
-        return _best_move_depth(state, topn, depth, context, -INF, INF)
+        if context.telemetry is not None:
+            context.telemetry.aspiration_window = 0
+            context.telemetry.aspiration_retries = 0
+        outcome = _best_move_depth(state, topn, depth, context, -INF, INF)
+        return _decorate_depth_result(outcome, aspiration_window=0, aspiration_retries=0)
 
     window = max(1, ASPIRATION_WINDOW_INIT)
     retries = 0
     while True:
         alpha = guess_score - window
         beta = guess_score + window
+        if context.telemetry is not None:
+            context.telemetry.aspiration_window = window
+            context.telemetry.aspiration_retries = retries
         outcome = _best_move_depth(state, topn, depth, context, alpha, beta)
         if not outcome.fail_low and not outcome.fail_high:
-            return outcome
+            return _decorate_depth_result(outcome, aspiration_window=window, aspiration_retries=retries)
         retries += 1
         if retries >= ASPIRATION_MAX_RETRIES:
-            return _best_move_depth(state, topn, depth, context, -INF, INF)
+            if context.telemetry is not None:
+                context.telemetry.aspiration_window = 0
+                context.telemetry.aspiration_retries = retries
+            outcome = _best_move_depth(state, topn, depth, context, -INF, INF)
+            return _decorate_depth_result(outcome, aspiration_window=0, aspiration_retries=retries)
         window *= 2
 
 
@@ -505,14 +701,104 @@ def solve_best_move(
     guess_score: Optional[int] = None,
     interrupt_check: Optional[Callable[[], bool]] = None,
     live_callback: Optional[Callable[[int, int], None]] = None,
+    telemetry_sink: Optional[TelemetrySink] = None,
 ) -> SearchResult:
     if tt is None:
         tt = {}
 
     start = time.perf_counter()
+    telemetry: Optional[_TelemetryStats] = None
+    if telemetry_sink is not None:
+        telemetry = _TelemetryStats(
+            sink=telemetry_sink,
+            solve_start=start,
+            last_emit=start,
+            state_key=state_key(state),
+        )
+        emit_dataclass_event(
+            telemetry.sink,
+            "search_start",
+            SearchStartEvent(
+                state_key=telemetry.state_key,
+                time_limit_ms=time_limit_ms,
+                start_depth=max(1, start_depth),
+            ),
+        )
+
+    def _emit_search_end(result: SearchResult, reason: str) -> None:
+        if telemetry is None:
+            return
+        # Force one final batch so dashboards don't stall between iterations.
+        _telemetry_maybe_emit_batch(
+            _SearchContext(tt=tt, deadline=None, telemetry=telemetry),
+            force=True,
+        )
+        emit_dataclass_event(
+            telemetry.sink,
+            "search_end",
+            SearchEndEvent(
+                best_move=result.best_move,
+                score=result.score,
+                depth=result.depth,
+                complete=result.complete,
+                nodes=result.nodes,
+                elapsed_ms=result.elapsed_ms,
+                reason=reason,
+            ),
+        )
+
+    def _emit_iteration_start(depth: int, guess: Optional[int]) -> None:
+        if telemetry is None:
+            return
+        if guess is None:
+            alpha = -INF
+            beta = INF
+        else:
+            alpha = guess - max(1, ASPIRATION_WINDOW_INIT)
+            beta = guess + max(1, ASPIRATION_WINDOW_INIT)
+        emit_dataclass_event(
+            telemetry.sink,
+            "iteration_start",
+            IterationStartEvent(
+                depth=depth,
+                aspiration_alpha=alpha,
+                aspiration_beta=beta,
+                guess_score=guess,
+            ),
+        )
+
+    def _emit_iteration_done(depth: int, depth_result: _DepthSearchResult, result: SearchResult) -> None:
+        if telemetry is None:
+            return
+        emit_dataclass_event(
+            telemetry.sink,
+            "iteration_done",
+            IterationDoneEvent(
+                depth=depth,
+                score=depth_result.score,
+                best_move=depth_result.best_move,
+                complete=result.complete,
+                nodes=result.nodes,
+                elapsed_ms=result.elapsed_ms,
+                max_depth=telemetry.max_depth,
+                aspiration_window=depth_result.aspiration_window,
+                aspiration_retries=depth_result.aspiration_retries,
+                root_scores=list(depth_result.root_scores),
+            ),
+        )
+        emit_dataclass_event(
+            telemetry.sink,
+            "pv_update",
+            PVUpdateEvent(
+                depth=depth,
+                pv_moves=_extract_pv_moves(state, tt),
+                score=depth_result.score,
+            ),
+        )
+
     if is_terminal(state):
         elapsed_ms = int((time.perf_counter() - start) * 1000)
-        return SearchResult(
+        result = SearchResult(
             best_move=None,
             score=terminal_diff(state),
             top_moves=[],
@@ -521,6 +807,8 @@ def solve_best_move(
             elapsed_ms=elapsed_ms,
             nodes=0,
         )
+        _emit_search_end(result, "complete")
+        return result
 
     last_live_emit = start
 
@@ -535,11 +823,14 @@ def solve_best_move(
         last_live_emit = now
 
     if time_limit_ms is None:
+        _emit_iteration_start(depth=0, guess=None)
         context = _SearchContext(
             tt=tt,
             deadline=None,
             interrupt_check=interrupt_check,
             live_nodes_callback=_emit_live,
+            telemetry=telemetry,
+            iter_depth=FULL_DEPTH,
         )
         try:
             depth_result = _best_move_depth(state, topn, FULL_DEPTH, context, -INF, INF)
@@ -558,6 +849,7 @@ def solve_best_move(
             _emit_live(result.nodes)
             if progress_callback is not None:
                 progress_callback(result)
+            _emit_search_end(result, "interrupted")
             return result
         elapsed_ms = int((time.perf_counter() - start) * 1000)
         result = SearchResult(
@@ -572,6 +864,8 @@ def solve_best_move(
         _emit_live(result.nodes)
         if progress_callback is not None:
             progress_callback(result)
+        _emit_iteration_done(depth=0, depth_result=depth_result, result=result)
+        _emit_search_end(result, "complete" if result.complete else "timeout")
         return result
 
     deadline = start + max(0, time_limit_ms) / 1000.0
@@ -579,16 +873,20 @@ def solve_best_move(
     best_result: Optional[SearchResult] = None
     depth = max(1, start_depth)
     current_guess = guess_score
+    timed_out_due_interrupt = False
 
     while True:
         if time.perf_counter() >= deadline:
             break
 
+        _emit_iteration_start(depth=depth, guess=current_guess)
         context = _SearchContext(
             tt=tt,
             deadline=deadline,
             interrupt_check=interrupt_check,
             live_nodes_callback=lambda iter_nodes, base_nodes=total_nodes: _emit_live(base_nodes + iter_nodes),
+            telemetry=telemetry,
+            iter_depth=depth,
         )
         try:
             depth_result = _run_depth_iteration_with_aspiration(
@@ -599,6 +897,8 @@ def solve_best_move(
                 context=context,
             )
         except SearchTimeout:
+            if context.interrupted:
+                timed_out_due_interrupt = True
             break
 
         total_nodes += context.nodes
@@ -614,14 +914,17 @@ def solve_best_move(
             nodes=total_nodes,
         )
         best_result = result
+        _emit_iteration_done(depth=depth, depth_result=depth_result, result=result)
         if progress_callback is not None:
             progress_callback(result)
         if result.complete:
+            _emit_search_end(result, "complete")
             return result
         current_guess = result.score
         depth += 1
 
     if best_result is not None:
+        _emit_search_end(best_result, "interrupted" if timed_out_due_interrupt else "timeout")
         return best_result
 
     # Deadline was hit before completing the first requested depth.
@@ -629,7 +932,7 @@ def solve_best_move(
         move_guess = _tt_best_move(state, tt)
         elapsed_ms = int((time.perf_counter() - start) * 1000)
         top_guess = [(move_guess, guess_score)] if move_guess is not None else []
-        return SearchResult(
+        result = SearchResult(
             best_move=move_guess,
             score=guess_score,
             top_moves=top_guess,
@@ -638,10 +941,12 @@ def solve_best_move(
             elapsed_ms=elapsed_ms,
             nodes=0,
         )
+        _emit_search_end(result, "timeout")
+        return result
 
     move, score, top_moves = _fallback_best_move(state, topn)
     elapsed_ms = int((time.perf_counter() - start) * 1000)
-    return SearchResult(
+    result = SearchResult(
         best_move=move,
         score=score,
         top_moves=top_moves,
@@ -650,6 +955,8 @@ def solve_best_move(
         elapsed_ms=elapsed_ms,
         nodes=0,
     )
+    _emit_search_end(result, "timeout")
+    return result
 
 
 def best_move(

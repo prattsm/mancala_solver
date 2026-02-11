@@ -20,6 +20,7 @@ from mancala_engine import (
     pretty_print,
 )
 from mancala_solver import default_cache_path, load_tt, save_tt, solve_best_move
+from mancala_telemetry import ThreadedTCPSink, parse_host_port
 
 
 def prompt_yes_no(prompt: str) -> bool:
@@ -72,6 +73,12 @@ def main(argv: Optional[List[str]] = None) -> int:
         action="store_true",
         help="search to terminal (ignores --time-ms)",
     )
+    parser.add_argument(
+        "--telemetry",
+        type=str,
+        default="",
+        help="optional telemetry sidecar endpoint host:port",
+    )
     args = parser.parse_args(argv)
 
     if args.seeds < 0:
@@ -84,6 +91,14 @@ def main(argv: Optional[List[str]] = None) -> int:
     cache_path: Path = default_cache_path()
     tt = load_tt(cache_path)
     atexit.register(lambda: save_tt(tt, cache_path))
+    telemetry_sink: Optional[ThreadedTCPSink] = None
+    telemetry_endpoint = parse_host_port(args.telemetry) if args.telemetry else None
+    if telemetry_endpoint is None and args.telemetry:
+        print("Invalid --telemetry endpoint, expected host:port")
+        return 2
+    if telemetry_endpoint is not None:
+        telemetry_sink = ThreadedTCPSink(telemetry_endpoint[0], telemetry_endpoint[1])
+        atexit.register(telemetry_sink.close)
 
     while True:
         print()
@@ -104,7 +119,13 @@ def main(argv: Optional[List[str]] = None) -> int:
                 time_limit_ms = None
             else:
                 time_limit_ms = args.time_ms
-            result = solve_best_move(state, topn=args.topn, tt=tt, time_limit_ms=time_limit_ms)
+            result = solve_best_move(
+                state,
+                topn=args.topn,
+                tt=tt,
+                time_limit_ms=time_limit_ms,
+                telemetry_sink=telemetry_sink,
+            )
             recommended_move = result.best_move
             if recommended_move is None:
                 print("No legal moves.")

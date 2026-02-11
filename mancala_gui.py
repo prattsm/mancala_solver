@@ -6,6 +6,7 @@ import sys
 import threading
 import time
 import traceback
+import os
 from dataclasses import dataclass
 from pathlib import Path
 from typing import List, Optional, Tuple
@@ -59,6 +60,7 @@ from mancala_engine import (
     legal_moves,
 )
 from mancala_solver import SearchResult, default_cache_path, load_tt, save_tt, solve_best_move
+from mancala_telemetry import ThreadedTCPSink, parse_host_port
 
 SOLVE_SLICE_MS = 300
 SOLVE_REQUEUE_DELAY_MS = 50
@@ -103,6 +105,11 @@ class SolverWorker(QObject):
         self.tt = {}
         self.tt_lock = threading.Lock()
         self.latest_request_id = 0
+        self.telemetry_sink: Optional[ThreadedTCPSink] = None
+        endpoint_raw = os.environ.get("MANCALA_TELEMETRY", "").strip()
+        endpoint = parse_host_port(endpoint_raw) if endpoint_raw else None
+        if endpoint is not None:
+            self.telemetry_sink = ThreadedTCPSink(endpoint[0], endpoint[1])
 
     def set_latest_request_id(self, request_id: int) -> None:
         self.latest_request_id = request_id
@@ -146,6 +153,7 @@ class SolverWorker(QObject):
                     guess_score=guess_score,
                     interrupt_check=_is_interrupted,
                     live_callback=_on_live,
+                    telemetry_sink=self.telemetry_sink,
                 )
         except InterruptedError:
             return
@@ -175,6 +183,10 @@ class SolverWorker(QObject):
             return dict(self.tt)
         finally:
             self.tt_lock.release()
+
+    def close(self) -> None:
+        if self.telemetry_sink is not None:
+            self.telemetry_sink.close()
 
 
 class PitButton(QPushButton):
@@ -1788,6 +1800,7 @@ class MancalaWindow(QMainWindow):
         if not stopped:
             self.solver_thread.terminate()
             self.solver_thread.wait(500)
+        self.solver_worker.close()
         cache_snapshot = self.solver_worker.try_snapshot_cache()
         if cache_snapshot is not None:
             save_tt(cache_snapshot, self.cache_path)
