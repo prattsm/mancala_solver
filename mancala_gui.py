@@ -92,8 +92,8 @@ class SolverWorker(QObject):
         self.tt = {}
         self.tt_lock = threading.Lock()
 
-    @Slot(object, int, int, object)
-    def solve(self, state: State, topn: int, request_id: int, time_limit_ms: Optional[int]) -> None:
+    @Slot(object, int, int)
+    def solve(self, state: State, topn: int, request_id: int) -> None:
         if QThread.currentThread().isInterruptionRequested():
             return
 
@@ -108,7 +108,7 @@ class SolverWorker(QObject):
                     state,
                     topn=topn,
                     tt=self.tt,
-                    time_limit_ms=time_limit_ms,
+                    time_limit_ms=300,
                     progress_callback=_on_progress,
                 )
         except InterruptedError:
@@ -178,7 +178,7 @@ class StoreWidget(QFrame):
 
 
 class MancalaWindow(QMainWindow):
-    solve_requested = Signal(object, int, int, object)
+    solve_requested = Signal(object, int, int)
 
     def __init__(self) -> None:
         super().__init__()
@@ -208,7 +208,6 @@ class MancalaWindow(QMainWindow):
         self.solving = False
         self.animating = False
         self.closing = False
-        self.solve_time_limit_ms: Optional[int] = 2400
 
         self.anim_counts_you: Optional[List[int]] = None
         self.anim_counts_opp: Optional[List[int]] = None
@@ -1143,7 +1142,7 @@ class MancalaWindow(QMainWindow):
         if not preserve_progress:
             self.search_progress = None
         self.solving = True
-        self.solve_requested.emit(state, self.topn, self.solve_request_id, self.solve_time_limit_ms)
+        self.solve_requested.emit(state, self.topn, self.solve_request_id)
 
     def _apply_search_result(self, result: SearchResult) -> None:
         self.search_progress = result
@@ -1370,26 +1369,20 @@ class MancalaWindow(QMainWindow):
 
         if self.animating:
             status_parts.append("Animating...")
-        if self.solving and self.state.to_move == YOU:
-            if self.search_progress is not None and self.search_progress.best_move is not None:
-                elapsed_s = max(0.001, self.search_progress.elapsed_ms / 1000.0)
-                nps = int(self.search_progress.nodes / elapsed_s)
+        if self.state.to_move == YOU and self.search_progress is not None and self.search_progress.best_move is not None:
+            if self.search_progress.complete:
                 status_parts.append(
-                    f"Searching... depth {self.search_progress.depth} (complete depth), "
-                    f"best so far: pit {self.search_progress.best_move} ({self.search_progress.score:+d}), "
-                    f"nodes {self.search_progress.nodes}, nps {nps}"
+                    f"Solved (perfect): pit {self.search_progress.best_move}, "
+                    f"score {self.search_progress.score:+d}"
                 )
             else:
-                status_parts.append("Solving...")
-        elif (
-            self.state.to_move == YOU
-            and self.search_progress is not None
-            and self.search_progress.complete
-            and self.search_progress.best_move is not None
-        ):
-            status_parts.append(
-                f"Solved (perfect): pit {self.search_progress.best_move} ({self.search_progress.score:+d})"
-            )
+                status_parts.append(
+                    f"Searching... depth {self.search_progress.depth} "
+                    f"(best so far: pit {self.search_progress.best_move}, "
+                    f"score {self.search_progress.score:+d})"
+                )
+        elif self.solving and self.state.to_move == YOU:
+            status_parts.append("Searching...")
         self.status_label.setText(" | ".join(status_parts))
 
     def _format_drop_location(self, drop: DropLocation) -> str:
