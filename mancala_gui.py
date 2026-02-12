@@ -34,6 +34,7 @@ from PySide6.QtWidgets import (
     QButtonGroup,
     QCheckBox,
     QComboBox,
+    QDialog,
     QFrame,
     QGridLayout,
     QHBoxLayout,
@@ -354,6 +355,9 @@ class MancalaWindow(QMainWindow):
         self.cache_save_results: "mp.Queue[Tuple[bool, int]]" = mp.Queue(maxsize=8)
         self.cache_save_process: Optional[mp.Process] = None
         self.cache_save_pending_counter: Optional[int] = None
+        self.shutdown_dialog: Optional[QDialog] = None
+        self.shutdown_label: Optional[QLabel] = None
+        self.shutdown_progress: Optional[QProgressBar] = None
 
         self.anim_counts_you: Optional[List[int]] = None
         self.anim_counts_opp: Optional[List[int]] = None
@@ -655,6 +659,65 @@ class MancalaWindow(QMainWindow):
             return
         self.schedule_solve_if_needed()
 
+    def _pump_ui_events(self) -> None:
+        app = QApplication.instance()
+        if app is not None:
+            app.processEvents()
+
+    def _show_shutdown_dialog(self) -> None:
+        if self.shutdown_dialog is not None:
+            return
+        dialog = QDialog(self)
+        dialog.setWindowTitle("Closing")
+        dialog.setModal(True)
+        dialog.setWindowFlag(Qt.WindowCloseButtonHint, False)
+        dialog.setWindowFlag(Qt.WindowContextHelpButtonHint, False)
+        dialog.setMinimumWidth(360)
+        layout = QVBoxLayout(dialog)
+        layout.setContentsMargins(16, 16, 16, 16)
+        layout.setSpacing(10)
+        label = QLabel("Closing app...")
+        label.setWordWrap(True)
+        progress = QProgressBar()
+        progress.setRange(0, 0)
+        progress.setTextVisible(False)
+        progress.setFixedHeight(12)
+        layout.addWidget(label)
+        layout.addWidget(progress)
+        dialog.show()
+        dialog.raise_()
+        self.shutdown_dialog = dialog
+        self.shutdown_label = label
+        self.shutdown_progress = progress
+        self._pump_ui_events()
+
+    def _update_shutdown_status(self, text: str) -> None:
+        if self.shutdown_label is not None:
+            self.shutdown_label.setText(text)
+        self._pump_ui_events()
+
+    def _hide_shutdown_dialog(self) -> None:
+        dialog = self.shutdown_dialog
+        if dialog is None:
+            return
+        dialog.hide()
+        dialog.deleteLater()
+        self.shutdown_dialog = None
+        self.shutdown_label = None
+        self.shutdown_progress = None
+
+    def _wait_for_solver_thread_with_updates(self, timeout_ms: int, phase_text: str) -> bool:
+        deadline = time.perf_counter() + (max(0, timeout_ms) / 1000.0)
+        while True:
+            remaining_ms = int((deadline - time.perf_counter()) * 1000)
+            if remaining_ms <= 0:
+                return False
+            chunk_ms = min(100, remaining_ms)
+            if self.solver_thread.wait(chunk_ms):
+                return True
+            elapsed_s = (timeout_ms - remaining_ms) / 1000.0
+            self._update_shutdown_status(f"{phase_text} ({elapsed_s:.1f}s)")
+
     def _ensure_cache_save_worker(self) -> bool:
         process = self.cache_save_process
         if process is not None and process.is_alive():
@@ -755,7 +818,7 @@ class MancalaWindow(QMainWindow):
                 self.cache_save_pending_counter = None
         return updated
 
-    def _wait_for_cache_save_completion(self, timeout_ms: int) -> bool:
+    def _wait_for_cache_save_completion(self, timeout_ms: int, phase_text: Optional[str] = None) -> bool:
         if timeout_ms <= 0:
             self._poll_cache_save_completion()
             return not self._cache_save_in_progress()
@@ -764,6 +827,10 @@ class MancalaWindow(QMainWindow):
             self._poll_cache_save_completion()
             if not self._cache_save_in_progress():
                 return True
+            if phase_text is not None:
+                self._update_shutdown_status(phase_text)
+            else:
+                self._pump_ui_events()
             time.sleep(CACHE_SAVE_POLL_MS / 1000.0)
         self._poll_cache_save_completion()
         return not self._cache_save_in_progress()
@@ -2041,6 +2108,7 @@ class MancalaWindow(QMainWindow):
         def _remaining_ms() -> int:
             return max(0, int((deadline - time.perf_counter()) * 1000))
 
+        self._update_shutdown_status("Saving cache...")
         self._poll_cache_save_completion()
         if self.solver_worker.is_cache_dirty():
             snapshot_with_counter = self.solver_worker.try_snapshot_cache_with_counter()
@@ -2048,12 +2116,17 @@ class MancalaWindow(QMainWindow):
                 snapshot, mutation_counter = snapshot_with_counter
                 self._start_cache_save(snapshot, mutation_counter)
 
-        self._wait_for_cache_save_completion(_remaining_ms())
+        self._wait_for_cache_save_completion(_remaining_ms(), phase_text="Saving cache...")
         self._poll_cache_save_completion()
         self._shutdown_cache_save_worker(_remaining_ms())
 
     def closeEvent(self, event) -> None:
+        if self.closing:
+            event.accept()
+            return
         self.closing = True
+        self._show_shutdown_dialog()
+        self._update_shutdown_status("Preparing to close...")
         self.autosave_enabled = False
         self.cache_autosave_timer.stop()
         self.solving = False
@@ -2077,14 +2150,20 @@ class MancalaWindow(QMainWindow):
             self.solve_requested.disconnect(self.solver_worker.solve)
         except (RuntimeError, TypeError):
             pass
-        self.solver_thread.requestInterruption()
-        self.solver_thread.quit()
-        stopped = self.solver_thread.wait(3000)
-        if not stopped:
-            self.solver_thread.terminate()
-            self.solver_thread.wait(500)
-        self._finalize_cache_save_before_close()
-        self.solver_worker.close()
+        try:
+            self._update_shutdown_status("Stopping solver...")
+            self.solver_thread.requestInterruption()
+            self.solver_thread.quit()
+            stopped = self._wait_for_solver_thread_with_updates(3000, "Stopping solver...")
+            if not stopped:
+                self._update_shutdown_status("Force stopping solver...")
+                self.solver_thread.terminate()
+                self._wait_for_solver_thread_with_updates(500, "Force stopping solver...")
+            self._finalize_cache_save_before_close()
+            self._update_shutdown_status("Finishing...")
+            self.solver_worker.close()
+        finally:
+            self._hide_shutdown_dialog()
         super().closeEvent(event)
 
     def resizeEvent(self, event) -> None:

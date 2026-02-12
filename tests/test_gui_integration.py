@@ -276,13 +276,14 @@ class TestGUIIntegration(unittest.TestCase):
         self.assertEqual(self.window.current_best_move, 4)
 
     def test_close_event_uses_bounded_wait_and_terminate_fallback(self) -> None:
-        self.window.solver_thread.wait_results = [False, True]
+        self.window.solver_thread.wait_results = [False] * 64
         self.window.solver_worker.tt_mutation_counter = 1
         event = QCloseEvent()
 
         self.window.closeEvent(event)
 
-        self.assertEqual(self.window.solver_thread.wait_calls, [3000, 500])
+        self.assertTrue(self.window.solver_thread.wait_calls)
+        self.assertTrue(all(timeout <= 100 for timeout in self.window.solver_thread.wait_calls))
         self.assertTrue(self.window.solver_thread.terminate_called)
         self.assertEqual(self.window.solver_worker.tt_saved_counter, 1)
         self.window = None
