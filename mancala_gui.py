@@ -557,6 +557,11 @@ class MancalaWindow(QMainWindow):
         self.solve_age_label.setWordWrap(True)
         side_panel.addWidget(self.solve_age_label)
 
+        self.solve_heartbeat_label = QLabel("Solver heartbeat: -")
+        self.solve_heartbeat_label.setObjectName("SolveHeartbeat")
+        self.solve_heartbeat_label.setWordWrap(True)
+        side_panel.addWidget(self.solve_heartbeat_label)
+
         self.solve_metrics_label = QLabel("Nodes 0 | NPS 0/s | Elapsed 0.0s")
         self.solve_metrics_label.setObjectName("SolveMetrics")
         self.solve_metrics_label.setWordWrap(True)
@@ -934,6 +939,7 @@ class MancalaWindow(QMainWindow):
             QLabel#SolveBest { color: #f6efdf; }
             QLabel#SolveDepth { color: #e9ddc8; }
             QLabel#SolveAge { color: #dbc8a8; font-size: 10px; }
+            QLabel#SolveHeartbeat { color: #d9c8aa; font-size: 10px; }
             QLabel#SolveMetrics { color: #d8ccb9; font-size: 10px; }
             QLabel#SliceProgress { color: #e9ddc8; font-size: 10px; font-weight: 600; }
             QFrame#SidePanel {
@@ -2148,6 +2154,22 @@ class MancalaWindow(QMainWindow):
         else:
             age_s = max(0.0, time.perf_counter() - self.last_best_update_time)
             self.solve_age_label.setText(f"Last best update: {age_s:.1f}s ago")
+
+        callback_age_s = max(0.0, time.perf_counter() - self.last_solver_activity)
+        if self.solving:
+            spinner = "|/-\\"[self.search_heartbeat_phase % 4]
+            if callback_age_s < 1.5:
+                heartbeat_text = f"Solver heartbeat: active {spinner} (last callback {callback_age_s:.1f}s ago)"
+            elif callback_age_s < 5.0:
+                heartbeat_text = f"Solver heartbeat: working {spinner} (last callback {callback_age_s:.1f}s ago)"
+            else:
+                heartbeat_text = (
+                    "Solver heartbeat: heavy branch "
+                    f"{spinner} (last callback {callback_age_s:.1f}s ago)"
+                )
+        else:
+            heartbeat_text = "Solver heartbeat: idle"
+        self.solve_heartbeat_label.setText(heartbeat_text)
 
         self.solve_metrics_label.setText(
             f"Nodes {self._format_nodes(nodes)} | NPS {self._format_nodes(nps)}/s | Elapsed {elapsed_s:.1f}s"
