@@ -313,6 +313,34 @@ class TestEngine(unittest.TestCase):
             solver_mod.TT_MAX_ENTRIES = original_max
             solver_mod.TT_PRUNE_TO = original_prune_to
 
+    def test_tt_store_mutation_callback_only_when_tt_changes(self):
+        state = make_state(YOU, [1, 1, 1, 1, 1, 1], [1, 1, 1, 1, 1, 1], 0, 0)
+        tt = {}
+        mutations = {"count": 0}
+
+        def on_mutation():
+            mutations["count"] += 1
+
+        solver_mod._tt_store(tt, state, TTEntry(3, EXACT, 1, 4), on_mutation=on_mutation)
+        self.assertEqual(mutations["count"], 1)
+
+        # Shallower entry should be ignored, so no mutation callback.
+        solver_mod._tt_store(tt, state, TTEntry(5, EXACT, 2, 2), on_mutation=on_mutation)
+        self.assertEqual(mutations["count"], 1)
+
+        original_max = solver_mod.TT_MAX_ENTRIES
+        original_prune_to = solver_mod.TT_PRUNE_TO
+        try:
+            solver_mod.TT_MAX_ENTRIES = 1
+            solver_mod.TT_PRUNE_TO = 1
+            state_2 = make_state(YOU, [1, 1, 1, 1, 1, 1], [1, 1, 1, 1, 1, 1], 1, 0)
+            solver_mod._tt_store(tt, state_2, TTEntry(2, EXACT, 2, 3), on_mutation=on_mutation)
+            # One callback for store and one for prune.
+            self.assertEqual(mutations["count"], 3)
+        finally:
+            solver_mod.TT_MAX_ENTRIES = original_max
+            solver_mod.TT_PRUNE_TO = original_prune_to
+
     def test_tt_cutoff_requires_sufficient_depth(self):
         state = make_state(YOU, [2, 2, 0, 0, 0, 0], [2, 2, 0, 0, 0, 0], 0, 0)
         norm_state, _ = solver_mod.normalize_state(state)

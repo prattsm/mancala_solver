@@ -50,7 +50,9 @@ if HAS_QT:
             self.latest_request_id = 0
             self.cache = {}
             self.solve_calls = []
-            self.try_snapshot_calls = []
+            self.try_snapshot_calls = 0
+            self.tt_mutation_counter = 0
+            self.tt_saved_counter = 0
 
         def set_latest_request_id(self, request_id: int) -> None:
             self.latest_request_id = request_id
@@ -60,6 +62,8 @@ if HAS_QT:
 
         def set_cache(self, tt) -> None:
             self.cache = dict(tt)
+            self.tt_mutation_counter = 0
+            self.tt_saved_counter = 0
 
         def cache_size(self) -> int:
             return len(self.cache)
@@ -75,8 +79,22 @@ if HAS_QT:
             return snapshot
 
         def try_snapshot_cache(self, max_entries=None):
-            self.try_snapshot_calls.append(max_entries)
+            self.try_snapshot_calls += 1
             return self.snapshot_cache(max_entries=max_entries)
+
+        def snapshot_cache_with_counter(self):
+            return dict(self.cache), self.tt_mutation_counter
+
+        def try_snapshot_cache_with_counter(self):
+            self.try_snapshot_calls += 1
+            return self.snapshot_cache_with_counter()
+
+        def is_cache_dirty(self) -> bool:
+            return self.tt_mutation_counter != self.tt_saved_counter
+
+        def mark_cache_saved(self, mutation_counter: int) -> None:
+            if mutation_counter > self.tt_saved_counter:
+                self.tt_saved_counter = mutation_counter
 
         def close(self) -> None:
             return
@@ -107,6 +125,7 @@ class TestGUIIntegration(unittest.TestCase):
 
         self.window = gui_mod.MancalaWindow()
         self.window.slice_progress_timer.stop()
+        self.window.cache_autosave_timer.stop()
         self.window.slice_start_time = None
         self.window.solving = False
         self.window.requeue_pending = False
@@ -241,6 +260,7 @@ class TestGUIIntegration(unittest.TestCase):
 
     def test_close_event_uses_bounded_wait_and_terminate_fallback(self) -> None:
         self.window.solver_thread.wait_results = [False, True]
+        self.window.solver_worker.tt_mutation_counter = 1
         event = QCloseEvent()
 
         self.window.closeEvent(event)
@@ -250,15 +270,13 @@ class TestGUIIntegration(unittest.TestCase):
         self.save_tt_mock.assert_called_once()
         self.window = None
 
-    def test_close_event_limits_cache_snapshot_size(self) -> None:
-        with patch.object(gui_mod, "MAX_CACHE_SAVE_ENTRIES_ON_CLOSE", 5):
-            self.window.solver_worker.cache = {idx: idx for idx in range(12)}
-            event = QCloseEvent()
-            self.window.closeEvent(event)
+    def test_close_event_skips_save_when_not_dirty(self) -> None:
+        self.window.solver_worker.tt_mutation_counter = 0
+        self.window.solver_worker.tt_saved_counter = 0
+        event = QCloseEvent()
+        self.window.closeEvent(event)
 
-        self.assertEqual(self.window.solver_worker.try_snapshot_calls[-1], 5)
-        snapshot = self.save_tt_mock.call_args[0][0]
-        self.assertEqual(len(snapshot), 5)
+        self.save_tt_mock.assert_not_called()
         self.window = None
 
 
@@ -285,6 +303,7 @@ class TestGUISettingsPersistence(unittest.TestCase):
 
         self.window = gui_mod.MancalaWindow()
         self.window.slice_progress_timer.stop()
+        self.window.cache_autosave_timer.stop()
         self.window.solving = False
 
     def tearDown(self) -> None:

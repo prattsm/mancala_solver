@@ -6,6 +6,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Callable, Dict, List, Optional, Tuple
 import gzip
+import os
 import pickle
 import time
 
@@ -41,6 +42,7 @@ LIVE_EMIT_INTERVAL_MS = 120
 TELEMETRY_NODE_MASK = 0x3FF
 TELEMETRY_DEPTH_SAMPLE_MASK = 0x7
 TELEMETRY_EMIT_INTERVAL_MS = 120
+CACHE_GZIP_LEVEL = 1
 
 EXACT = 0
 LOWER = 1
@@ -72,6 +74,7 @@ class _SearchContext:
     tt: Dict[State, TTEntry]
     deadline: Optional[float]
     interrupt_check: Optional[Callable[[], bool]] = None
+    tt_mutation_callback: Optional[Callable[[], None]] = None
     live_nodes_callback: Optional[Callable[[int], None]] = None
     telemetry: Optional["_TelemetryStats"] = None
     iter_depth: int = 0
@@ -155,14 +158,22 @@ def _tt_get(tt: Dict[State, TTEntry], state: State) -> Optional[TTEntry]:
     return tt.get(state)
 
 
-def _prune_tt(tt: Dict[State, TTEntry]) -> None:
+def _prune_tt(tt: Dict[State, TTEntry]) -> bool:
     if len(tt) <= TT_MAX_ENTRIES:
-        return
+        return False
+    pruned = False
     while len(tt) > TT_PRUNE_TO:
         tt.pop(next(iter(tt)))
+        pruned = True
+    return pruned
 
 
-def _tt_store(tt: Dict[State, TTEntry], state: State, entry: TTEntry) -> None:
+def _tt_store(
+    tt: Dict[State, TTEntry],
+    state: State,
+    entry: TTEntry,
+    on_mutation: Optional[Callable[[], None]] = None,
+) -> None:
     existing = tt.get(state)
     if existing is not None:
         if existing.depth > entry.depth:
@@ -178,8 +189,11 @@ def _tt_store(tt: Dict[State, TTEntry], state: State, entry: TTEntry) -> None:
         ):
             return
     tt[state] = entry
-    if len(tt) > TT_MAX_ENTRIES:
-        _prune_tt(tt)
+    if on_mutation is not None:
+        on_mutation()
+    if _prune_tt(tt):
+        if on_mutation is not None:
+            on_mutation()
 
 
 def load_tt(path: Path) -> Dict[State, TTEntry]:
@@ -200,8 +214,29 @@ def load_tt(path: Path) -> Dict[State, TTEntry]:
 
     tt: Dict[State, TTEntry] = {}
     for key, entry in raw_tt.items():
-        if not isinstance(key, str):
+        state: Optional[State] = None
+        if isinstance(key, State):
+            state = key
+        elif isinstance(key, str):
+            state = key_to_state(key)
+        else:
             continue
+
+        if state is None:
+            continue
+
+        if isinstance(entry, TTEntry):
+            if entry.flag not in {EXACT, LOWER, UPPER}:
+                continue
+            if entry.best_move is not None and not isinstance(entry.best_move, int):
+                continue
+            if not isinstance(entry.depth, int) or entry.depth < 0:
+                continue
+            if not isinstance(entry.proven, bool):
+                continue
+            tt[state] = entry
+            continue
+
         if not isinstance(entry, tuple) or len(entry) not in {4, 5}:
             continue
         if len(entry) == 4:
@@ -219,9 +254,6 @@ def load_tt(path: Path) -> Dict[State, TTEntry]:
             continue
         if not isinstance(proven, bool):
             continue
-        state = key_to_state(key)
-        if state is None:
-            continue
         tt[state] = TTEntry(value, flag, best_move, depth, proven)
     _prune_tt(tt)
     return tt
@@ -232,15 +264,20 @@ def save_tt(tt: Dict[State, TTEntry], path: Path) -> None:
         path.parent.mkdir(parents=True, exist_ok=True)
         data = {
             "version": CACHE_VERSION,
-            "tt": {
-                state_key(state): (entry.value, entry.flag, entry.best_move, entry.depth, entry.proven)
-                for state, entry in tt.items()
-            },
+            "tt": tt,
         }
         tmp_path = path.with_suffix(path.suffix + ".tmp") if path.suffix else path.with_name(path.name + ".tmp")
-        with gzip.open(tmp_path, "wb") as handle:
+        with gzip.open(tmp_path, "wb", compresslevel=CACHE_GZIP_LEVEL) as handle:
             pickle.dump(data, handle, protocol=pickle.HIGHEST_PROTOCOL)
+            handle.flush()
+            if hasattr(handle, "fileobj") and handle.fileobj is not None:
+                os.fsync(handle.fileobj.fileno())
         tmp_path.replace(path)
+        parent_fd = os.open(path.parent, os.O_RDONLY)
+        try:
+            os.fsync(parent_fd)
+        finally:
+            os.close(parent_fd)
     except OSError:
         return
 
@@ -576,7 +613,12 @@ def _search_depth(
     exact_proven = best_proven if flag == EXACT else False
     if context.telemetry is not None:
         context.telemetry.tt_stores += 1
-    _tt_store(context.tt, norm_state, TTEntry(value_norm, flag_norm, best_move_norm, depth, exact_proven))
+    _tt_store(
+        context.tt,
+        norm_state,
+        TTEntry(value_norm, flag_norm, best_move_norm, depth, exact_proven),
+        on_mutation=context.tt_mutation_callback,
+    )
     return best, exact_proven
 
 
@@ -717,6 +759,7 @@ def solve_best_move(
     guess_score: Optional[int] = None,
     previous_result: Optional[SearchResult] = None,
     interrupt_check: Optional[Callable[[], bool]] = None,
+    tt_mutation_callback: Optional[Callable[[], None]] = None,
     live_callback: Optional[Callable[[int, int], None]] = None,
     telemetry_sink: Optional[TelemetrySink] = None,
 ) -> SearchResult:
@@ -847,6 +890,7 @@ def solve_best_move(
             tt=tt,
             deadline=None,
             interrupt_check=interrupt_check,
+            tt_mutation_callback=tt_mutation_callback,
             live_nodes_callback=_emit_live,
             telemetry=telemetry,
             iter_depth=FULL_DEPTH,
@@ -903,6 +947,7 @@ def solve_best_move(
             tt=tt,
             deadline=deadline,
             interrupt_check=interrupt_check,
+            tt_mutation_callback=tt_mutation_callback,
             live_nodes_callback=lambda iter_nodes, base_nodes=total_nodes: _emit_live(base_nodes + iter_nodes),
             telemetry=telemetry,
             iter_depth=depth,

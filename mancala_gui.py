@@ -64,7 +64,10 @@ from mancala_telemetry import ThreadedTCPSink, parse_host_port
 
 SOLVE_SLICE_MS = 500
 SOLVE_REQUEUE_DELAY_MS = 50
-MAX_CACHE_SAVE_ENTRIES_ON_CLOSE = 50_000
+CACHE_AUTOSAVE_CHECK_MS = 1000
+CACHE_AUTOSAVE_INTERVAL_MS = 20_000
+CACHE_AUTOSAVE_IDLE_MS = 2_000
+CACHE_CLOSE_SAVE_TIMEOUT_MS = 1_200
 SETTINGS_ORG = "prattsm"
 SETTINGS_APP = "mancala_solver"
 
@@ -106,6 +109,8 @@ class SolverWorker(QObject):
         self.tt = {}
         self.tt_lock = threading.Lock()
         self.latest_request_id = 0
+        self.tt_mutation_counter = 0
+        self.tt_saved_counter = 0
         self.telemetry_sink: Optional[ThreadedTCPSink] = None
         endpoint_raw = os.environ.get("MANCALA_TELEMETRY", "").strip()
         endpoint = parse_host_port(endpoint_raw) if endpoint_raw else None
@@ -114,6 +119,9 @@ class SolverWorker(QObject):
 
     def set_latest_request_id(self, request_id: int) -> None:
         self.latest_request_id = request_id
+
+    def _record_tt_mutation(self) -> None:
+        self.tt_mutation_counter += 1
 
     @Slot(object, int, int, int, object, object)
     def solve(
@@ -155,6 +163,7 @@ class SolverWorker(QObject):
                     guess_score=guess_score,
                     previous_result=previous_result,
                     interrupt_check=_is_interrupted,
+                    tt_mutation_callback=self._record_tt_mutation,
                     live_callback=_on_live,
                     telemetry_sink=self.telemetry_sink,
                 )
@@ -174,6 +183,8 @@ class SolverWorker(QObject):
     def set_cache(self, tt) -> None:
         with self.tt_lock:
             self.tt = tt
+        self.tt_mutation_counter = 0
+        self.tt_saved_counter = 0
 
     def cache_size(self) -> int:
         with self.tt_lock:
@@ -193,6 +204,18 @@ class SolverWorker(QObject):
         with self.tt_lock:
             return self._snapshot_cache_locked(max_entries=max_entries)
 
+    def snapshot_cache_with_counter(self) -> Tuple[dict, int]:
+        with self.tt_lock:
+            return dict(self.tt), self.tt_mutation_counter
+
+    def try_snapshot_cache_with_counter(self) -> Optional[Tuple[dict, int]]:
+        if not self.tt_lock.acquire(blocking=False):
+            return None
+        try:
+            return dict(self.tt), self.tt_mutation_counter
+        finally:
+            self.tt_lock.release()
+
     def try_snapshot_cache(self, max_entries: Optional[int] = None) -> Optional[dict]:
         if not self.tt_lock.acquire(blocking=False):
             return None
@@ -200,6 +223,13 @@ class SolverWorker(QObject):
             return self._snapshot_cache_locked(max_entries=max_entries)
         finally:
             self.tt_lock.release()
+
+    def is_cache_dirty(self) -> bool:
+        return self.tt_mutation_counter != self.tt_saved_counter
+
+    def mark_cache_saved(self, mutation_counter: int) -> None:
+        if mutation_counter > self.tt_saved_counter:
+            self.tt_saved_counter = mutation_counter
 
     def close(self) -> None:
         if self.telemetry_sink is not None:
@@ -290,6 +320,12 @@ class MancalaWindow(QMainWindow):
         self.solver_error_text: Optional[str] = None
         self.live_nodes = 0
         self.live_elapsed_ms = 0
+        self.last_solver_activity = time.perf_counter()
+        self.last_cache_save_time = 0.0
+        self.autosave_enabled = True
+        self.cache_save_thread: Optional[threading.Thread] = None
+        self.cache_save_result_lock = threading.Lock()
+        self.cache_save_result: Optional[Tuple[bool, int]] = None
 
         self.anim_counts_you: Optional[List[int]] = None
         self.anim_counts_opp: Optional[List[int]] = None
@@ -311,6 +347,10 @@ class MancalaWindow(QMainWindow):
         self.slice_progress_timer = QTimer(self)
         self.slice_progress_timer.setInterval(200)
         self.slice_progress_timer.timeout.connect(self._update_slice_progress_bar)
+        self.cache_autosave_timer = QTimer(self)
+        self.cache_autosave_timer.setInterval(CACHE_AUTOSAVE_CHECK_MS)
+        self.cache_autosave_timer.timeout.connect(self._on_cache_autosave_timer)
+        self.cache_autosave_timer.start()
         self._apply_style()
         self._load_persistent_settings()
 
@@ -586,6 +626,70 @@ class MancalaWindow(QMainWindow):
         if self.closing:
             return
         self.schedule_solve_if_needed()
+
+    def _cache_save_in_progress(self) -> bool:
+        return self.cache_save_thread is not None and self.cache_save_thread.is_alive()
+
+    def _start_cache_save(self, snapshot: dict, mutation_counter: int) -> bool:
+        if self._cache_save_in_progress():
+            return False
+
+        def _save() -> None:
+            ok = True
+            try:
+                save_tt(snapshot, self.cache_path)
+            except Exception:
+                ok = False
+            with self.cache_save_result_lock:
+                self.cache_save_result = (ok, mutation_counter)
+
+        self.cache_save_thread = threading.Thread(target=_save, name="mancala-cache-save", daemon=True)
+        self.cache_save_thread.start()
+        return True
+
+    def _poll_cache_save_completion(self) -> bool:
+        with self.cache_save_result_lock:
+            result = self.cache_save_result
+            self.cache_save_result = None
+        if result is None:
+            return False
+        ok, mutation_counter = result
+        if ok:
+            self.solver_worker.mark_cache_saved(mutation_counter)
+            self.last_cache_save_time = time.perf_counter()
+        return True
+
+    def _wait_for_cache_save_completion(self, timeout_ms: int) -> bool:
+        if timeout_ms <= 0:
+            return not self._cache_save_in_progress()
+        thread = self.cache_save_thread
+        if thread is None or not thread.is_alive():
+            return True
+        thread.join(timeout_ms / 1000.0)
+        return not thread.is_alive()
+
+    def _on_cache_autosave_timer(self) -> None:
+        if not hasattr(self, "solver_worker"):
+            return
+        self._poll_cache_save_completion()
+        if self.closing or not self.autosave_enabled:
+            return
+        if self._cache_save_in_progress():
+            return
+        if self.solving:
+            return
+        now = time.perf_counter()
+        if (now - self.last_solver_activity) * 1000 < CACHE_AUTOSAVE_IDLE_MS:
+            return
+        if self.last_cache_save_time > 0 and (now - self.last_cache_save_time) * 1000 < CACHE_AUTOSAVE_INTERVAL_MS:
+            return
+        if not self.solver_worker.is_cache_dirty():
+            return
+        snapshot_with_counter = self.solver_worker.try_snapshot_cache_with_counter()
+        if snapshot_with_counter is None:
+            return
+        snapshot, mutation_counter = snapshot_with_counter
+        self._start_cache_save(snapshot, mutation_counter)
 
     def _apply_style(self) -> None:
         app = QApplication.instance()
@@ -1441,6 +1545,7 @@ class MancalaWindow(QMainWindow):
     ) -> None:
         if self.closing:
             return
+        self.last_solver_activity = time.perf_counter()
         self.requeue_pending = False
         self.solve_request_id += 1
         self._set_latest_request_id()
@@ -1497,6 +1602,7 @@ class MancalaWindow(QMainWindow):
             return
         if self.solve_target_state != self.state:
             return
+        self.last_solver_activity = time.perf_counter()
         if self._is_regressive_same_state_result(result):
             self.update_status()
             return
@@ -1514,6 +1620,7 @@ class MancalaWindow(QMainWindow):
             return
         if self.solve_target_state != self.state:
             return
+        self.last_solver_activity = time.perf_counter()
         self.live_nodes = max(self.live_nodes, nodes)
         self.live_elapsed_ms = max(self.live_elapsed_ms, elapsed_ms)
         self.update_status()
@@ -1526,6 +1633,7 @@ class MancalaWindow(QMainWindow):
             return
         if not isinstance(result, SearchResult):
             return
+        self.last_solver_activity = time.perf_counter()
         self.solving = False
         hide_after_ms: Optional[int] = None
         if result.complete or self.animating or self.state.to_move != YOU:
@@ -1557,6 +1665,7 @@ class MancalaWindow(QMainWindow):
             return
         if request_id != self.solve_request_id:
             return
+        self.last_solver_activity = time.perf_counter()
         self.solving = False
         self.requeue_pending = False
         self._finish_slice_progress(hide_after_ms=180)
@@ -1828,8 +1937,37 @@ class MancalaWindow(QMainWindow):
         pit_num = drop.index + 1
         return f"{drop.side} pit {pit_num}"
 
+    def _finalize_cache_save_before_close(self) -> None:
+        deadline = time.perf_counter() + (CACHE_CLOSE_SAVE_TIMEOUT_MS / 1000.0)
+
+        def _remaining_ms() -> int:
+            return max(0, int((deadline - time.perf_counter()) * 1000))
+
+        self._poll_cache_save_completion()
+
+        if self._cache_save_in_progress():
+            self._wait_for_cache_save_completion(_remaining_ms())
+            self._poll_cache_save_completion()
+
+        if self._cache_save_in_progress():
+            return
+
+        if not self.solver_worker.is_cache_dirty():
+            return
+
+        snapshot_with_counter = self.solver_worker.try_snapshot_cache_with_counter()
+        if snapshot_with_counter is None:
+            return
+        snapshot, mutation_counter = snapshot_with_counter
+        if not self._start_cache_save(snapshot, mutation_counter):
+            return
+        self._wait_for_cache_save_completion(_remaining_ms())
+        self._poll_cache_save_completion()
+
     def closeEvent(self, event) -> None:
         self.closing = True
+        self.autosave_enabled = False
+        self.cache_autosave_timer.stop()
         self.solving = False
         self.requeue_pending = False
         self._save_persistent_settings()
@@ -1857,14 +1995,8 @@ class MancalaWindow(QMainWindow):
         if not stopped:
             self.solver_thread.terminate()
             self.solver_thread.wait(500)
+        self._finalize_cache_save_before_close()
         self.solver_worker.close()
-        cache_size = self.solver_worker.cache_size()
-        snapshot_limit = None
-        if cache_size > MAX_CACHE_SAVE_ENTRIES_ON_CLOSE:
-            snapshot_limit = MAX_CACHE_SAVE_ENTRIES_ON_CLOSE
-        cache_snapshot = self.solver_worker.try_snapshot_cache(max_entries=snapshot_limit)
-        if cache_snapshot is not None:
-            save_tt(cache_snapshot, self.cache_path)
         super().closeEvent(event)
 
     def resizeEvent(self, event) -> None:
