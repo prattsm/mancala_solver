@@ -64,6 +64,7 @@ from mancala_telemetry import ThreadedTCPSink, parse_host_port
 
 SOLVE_SLICE_MS = 500
 SOLVE_REQUEUE_DELAY_MS = 50
+MAX_CACHE_SAVE_ENTRIES_ON_CLOSE = 50_000
 SETTINGS_ORG = "prattsm"
 SETTINGS_APP = "mancala_solver"
 
@@ -174,15 +175,29 @@ class SolverWorker(QObject):
         with self.tt_lock:
             self.tt = tt
 
-    def snapshot_cache(self) -> dict:
+    def cache_size(self) -> int:
         with self.tt_lock:
-            return dict(self.tt)
+            return len(self.tt)
 
-    def try_snapshot_cache(self) -> Optional[dict]:
+    def _snapshot_cache_locked(self, max_entries: Optional[int] = None) -> dict:
+        if max_entries is None or max_entries <= 0 or len(self.tt) <= max_entries:
+            return dict(self.tt)
+        snapshot = {}
+        for idx, (state, entry) in enumerate(self.tt.items()):
+            if idx >= max_entries:
+                break
+            snapshot[state] = entry
+        return snapshot
+
+    def snapshot_cache(self, max_entries: Optional[int] = None) -> dict:
+        with self.tt_lock:
+            return self._snapshot_cache_locked(max_entries=max_entries)
+
+    def try_snapshot_cache(self, max_entries: Optional[int] = None) -> Optional[dict]:
         if not self.tt_lock.acquire(blocking=False):
             return None
         try:
-            return dict(self.tt)
+            return self._snapshot_cache_locked(max_entries=max_entries)
         finally:
             self.tt_lock.release()
 
@@ -1843,7 +1858,11 @@ class MancalaWindow(QMainWindow):
             self.solver_thread.terminate()
             self.solver_thread.wait(500)
         self.solver_worker.close()
-        cache_snapshot = self.solver_worker.try_snapshot_cache()
+        cache_size = self.solver_worker.cache_size()
+        snapshot_limit = None
+        if cache_size > MAX_CACHE_SAVE_ENTRIES_ON_CLOSE:
+            snapshot_limit = MAX_CACHE_SAVE_ENTRIES_ON_CLOSE
+        cache_snapshot = self.solver_worker.try_snapshot_cache(max_entries=snapshot_limit)
         if cache_snapshot is not None:
             save_tt(cache_snapshot, self.cache_path)
         super().closeEvent(event)

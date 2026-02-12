@@ -50,6 +50,7 @@ if HAS_QT:
             self.latest_request_id = 0
             self.cache = {}
             self.solve_calls = []
+            self.try_snapshot_calls = []
 
         def set_latest_request_id(self, request_id: int) -> None:
             self.latest_request_id = request_id
@@ -60,11 +61,22 @@ if HAS_QT:
         def set_cache(self, tt) -> None:
             self.cache = dict(tt)
 
-        def snapshot_cache(self) -> dict:
-            return dict(self.cache)
+        def cache_size(self) -> int:
+            return len(self.cache)
 
-        def try_snapshot_cache(self):
-            return dict(self.cache)
+        def snapshot_cache(self, max_entries=None) -> dict:
+            if max_entries is None:
+                return dict(self.cache)
+            snapshot = {}
+            for idx, (key, value) in enumerate(self.cache.items()):
+                if idx >= max_entries:
+                    break
+                snapshot[key] = value
+            return snapshot
+
+        def try_snapshot_cache(self, max_entries=None):
+            self.try_snapshot_calls.append(max_entries)
+            return self.snapshot_cache(max_entries=max_entries)
 
         def close(self) -> None:
             return
@@ -236,6 +248,17 @@ class TestGUIIntegration(unittest.TestCase):
         self.assertEqual(self.window.solver_thread.wait_calls, [3000, 500])
         self.assertTrue(self.window.solver_thread.terminate_called)
         self.save_tt_mock.assert_called_once()
+        self.window = None
+
+    def test_close_event_limits_cache_snapshot_size(self) -> None:
+        with patch.object(gui_mod, "MAX_CACHE_SAVE_ENTRIES_ON_CLOSE", 5):
+            self.window.solver_worker.cache = {idx: idx for idx in range(12)}
+            event = QCloseEvent()
+            self.window.closeEvent(event)
+
+        self.assertEqual(self.window.solver_worker.try_snapshot_calls[-1], 5)
+        snapshot = self.save_tt_mock.call_args[0][0]
+        self.assertEqual(len(snapshot), 5)
         self.window = None
 
 
