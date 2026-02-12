@@ -484,7 +484,7 @@ class TestEngine(unittest.TestCase):
         original_search = solver_mod._search_depth
         calls = []
 
-        def fake_ordered_children(_state, _tt):
+        def fake_ordered_children(_state, _tt, context=None):
             return fake_children
 
         def fake_search(child_state, alpha, beta, depth, _context):
