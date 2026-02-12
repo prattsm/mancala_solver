@@ -107,6 +107,16 @@ if HAS_QT:
         window.solve_requested.connect(window.solver_worker.solve)
 
 
+    def _fake_start_cache_save(window: "gui_mod.MancalaWindow", _snapshot: dict, mutation_counter: int) -> bool:
+        window.solver_worker.mark_cache_saved(mutation_counter)
+        return True
+
+
+    def _fake_shutdown_cache_worker(window: "gui_mod.MancalaWindow", _timeout_ms: int) -> None:
+        window.cache_save_process = None
+        window.cache_save_pending_counter = None
+
+
 @unittest.skipUnless(HAS_QT, "PySide6 is required for GUI integration tests")
 class TestGUIIntegration(unittest.TestCase):
     @classmethod
@@ -117,11 +127,17 @@ class TestGUIIntegration(unittest.TestCase):
         self.slice_patch = patch.object(gui_mod, "SOLVE_SLICE_MS", 40)
         self.requeue_patch = patch.object(gui_mod, "SOLVE_REQUEUE_DELAY_MS", 1)
         self.setup_patch = patch.object(gui_mod.MancalaWindow, "_setup_solver", _fake_setup_solver)
-        self.save_patch = patch.object(gui_mod, "save_tt")
+        self.start_cache_patch = patch.object(gui_mod.MancalaWindow, "_start_cache_save", _fake_start_cache_save)
+        self.shutdown_cache_patch = patch.object(
+            gui_mod.MancalaWindow,
+            "_shutdown_cache_save_worker",
+            _fake_shutdown_cache_worker,
+        )
         self.slice_patch.start()
         self.requeue_patch.start()
         self.setup_patch.start()
-        self.save_tt_mock = self.save_patch.start()
+        self.start_cache_patch.start()
+        self.shutdown_cache_patch.start()
 
         self.window = gui_mod.MancalaWindow()
         self.window.slice_progress_timer.stop()
@@ -137,7 +153,8 @@ class TestGUIIntegration(unittest.TestCase):
         if self.window is not None:
             self.window.close()
             self.app.processEvents()
-        self.save_patch.stop()
+        self.shutdown_cache_patch.stop()
+        self.start_cache_patch.stop()
         self.setup_patch.stop()
         self.requeue_patch.stop()
         self.slice_patch.stop()
@@ -267,7 +284,7 @@ class TestGUIIntegration(unittest.TestCase):
 
         self.assertEqual(self.window.solver_thread.wait_calls, [3000, 500])
         self.assertTrue(self.window.solver_thread.terminate_called)
-        self.save_tt_mock.assert_called_once()
+        self.assertEqual(self.window.solver_worker.tt_saved_counter, 1)
         self.window = None
 
     def test_close_event_skips_save_when_not_dirty(self) -> None:
@@ -276,7 +293,7 @@ class TestGUIIntegration(unittest.TestCase):
         event = QCloseEvent()
         self.window.closeEvent(event)
 
-        self.save_tt_mock.assert_not_called()
+        self.assertEqual(self.window.solver_worker.tt_saved_counter, 0)
         self.window = None
 
 
@@ -295,11 +312,17 @@ class TestGUISettingsPersistence(unittest.TestCase):
         self.org_patch = patch.object(gui_mod, "SETTINGS_ORG", "mancala_test_org")
         self.app_patch = patch.object(gui_mod, "SETTINGS_APP", "mancala_test_app")
         self.setup_patch = patch.object(gui_mod.MancalaWindow, "_setup_solver", _fake_setup_solver)
-        self.save_patch = patch.object(gui_mod, "save_tt")
+        self.start_cache_patch = patch.object(gui_mod.MancalaWindow, "_start_cache_save", _fake_start_cache_save)
+        self.shutdown_cache_patch = patch.object(
+            gui_mod.MancalaWindow,
+            "_shutdown_cache_save_worker",
+            _fake_shutdown_cache_worker,
+        )
         self.org_patch.start()
         self.app_patch.start()
         self.setup_patch.start()
-        self.save_patch.start()
+        self.start_cache_patch.start()
+        self.shutdown_cache_patch.start()
 
         self.window = gui_mod.MancalaWindow()
         self.window.slice_progress_timer.stop()
@@ -310,7 +333,8 @@ class TestGUISettingsPersistence(unittest.TestCase):
         if self.window is not None:
             self.window.close()
             self.app.processEvents()
-        self.save_patch.stop()
+        self.shutdown_cache_patch.stop()
+        self.start_cache_patch.stop()
         self.setup_patch.stop()
         self.app_patch.stop()
         self.org_patch.stop()

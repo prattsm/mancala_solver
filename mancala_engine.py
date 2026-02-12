@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import List, Optional, Tuple
+from typing import Callable, List, Optional, Tuple
 
 YOU = "YOU"
 OPP = "OPP"
@@ -135,8 +135,18 @@ def apply_move_fast(state: State, pit_num: int) -> State:
     return apply_move_fast_with_info(state, pit_num)[0]
 
 
-def apply_move_fast_with_info(state: State, pit_num: int) -> tuple[State, bool, bool]:
-    new_state, extra_turn, capture = _apply_move_fast(state, pit_num)
+def apply_move_fast_with_info(
+    state: State,
+    pit_num: int,
+    poll_callback: Optional[Callable[[], None]] = None,
+    poll_mask: int = 0x3F,
+) -> tuple[State, bool, bool]:
+    new_state, extra_turn, capture = _apply_move_fast(
+        state,
+        pit_num,
+        poll_callback=poll_callback,
+        poll_mask=poll_mask,
+    )
     return new_state, extra_turn, capture
 
 
@@ -153,6 +163,8 @@ def _sow(
     mover: str,
     pit_index: int,
     record_drops: bool,
+    poll_callback: Optional[Callable[[], None]] = None,
+    poll_mask: int = 0x3F,
 ) -> tuple[List[int], List[int], int, int, int, int, DropLocation, Optional[List[DropLocation]]]:
     if mover == YOU:
         seeds = pits_you[pit_index]
@@ -173,6 +185,8 @@ def _sow(
     drops = [] if record_drops else None
     ring_kind = RING_KIND
     ring_pit = RING_PIT_INDEX
+    poll_every = max(1, poll_mask + 1)
+    drop_count = 0
 
     if drops is None:
         while seeds > 0:
@@ -187,6 +201,9 @@ def _sow(
             else:
                 store_opp += 1
             seeds -= 1
+            drop_count += 1
+            if poll_callback is not None and (drop_count % poll_every) == 0:
+                poll_callback()
     else:
         append_drop = drops.append
         while seeds > 0:
@@ -202,12 +219,20 @@ def _sow(
                 store_opp += 1
             append_drop(RING[pos])
             seeds -= 1
+            drop_count += 1
+            if poll_callback is not None and (drop_count % poll_every) == 0:
+                poll_callback()
 
     last_loc = RING[pos]
     return pits_you, pits_opp, store_you, store_opp, picked_count, pos, last_loc, drops
 
 
-def _apply_move_fast(state: State, pit_num: int) -> tuple[State, bool, bool]:
+def _apply_move_fast(
+    state: State,
+    pit_num: int,
+    poll_callback: Optional[Callable[[], None]] = None,
+    poll_mask: int = 0x3F,
+) -> tuple[State, bool, bool]:
     if pit_num < 1 or pit_num > 6:
         raise ValueError("pit number must be 1..6")
 
@@ -222,7 +247,15 @@ def _apply_move_fast(state: State, pit_num: int) -> tuple[State, bool, bool]:
     capture = False
 
     pits_you, pits_opp, store_you, store_opp, _, _, last_loc, _ = _sow(
-        pits_you, pits_opp, store_you, store_opp, to_move, i, False
+        pits_you,
+        pits_opp,
+        store_you,
+        store_opp,
+        to_move,
+        i,
+        False,
+        poll_callback=poll_callback,
+        poll_mask=poll_mask,
     )
 
     if to_move == YOU and last_loc.side == YOU and last_loc.index is not None:
