@@ -89,6 +89,10 @@ if HAS_QT:
             self.try_snapshot_calls += 1
             return self.snapshot_cache_with_counter()
 
+        def try_snapshot_cache_with_counter_budget(self, _budget_ms: int):
+            self.try_snapshot_calls += 1
+            return self.snapshot_cache_with_counter()
+
         def is_cache_dirty(self) -> bool:
             return self.tt_mutation_counter != self.tt_saved_counter
 

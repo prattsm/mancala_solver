@@ -71,7 +71,10 @@ CACHE_AUTOSAVE_CHECK_MS = 1000
 CACHE_AUTOSAVE_INTERVAL_MS = 20_000
 CACHE_AUTOSAVE_IDLE_MS = 2_000
 CACHE_CLOSE_SAVE_TIMEOUT_MS = 1_200
+CACHE_CLOSE_SNAPSHOT_BUDGET_MS = 120
 CACHE_SAVE_POLL_MS = 20
+SOLVER_CLOSE_TIMEOUT_MS = 3_000
+SOLVER_FORCE_STOP_TIMEOUT_MS = 500
 SETTINGS_ORG = "prattsm"
 SETTINGS_APP = "mancala_solver"
 
@@ -241,6 +244,23 @@ class SolverWorker(QObject):
             return None
         try:
             return dict(self.tt), self.tt_mutation_counter
+        finally:
+            self.tt_lock.release()
+
+    def try_snapshot_cache_with_counter_budget(self, budget_ms: int) -> Optional[Tuple[dict, int]]:
+        if budget_ms <= 0:
+            return None
+        if not self.tt_lock.acquire(blocking=False):
+            return None
+        deadline = time.perf_counter() + (budget_ms / 1000.0)
+        try:
+            snapshot: dict = {}
+            mutation_counter = self.tt_mutation_counter
+            for idx, (state, entry) in enumerate(self.tt.items()):
+                snapshot[state] = entry
+                if (idx & 0x3FF) == 0 and time.perf_counter() >= deadline:
+                    return None
+            return snapshot, mutation_counter
         finally:
             self.tt_lock.release()
 
@@ -2141,23 +2161,31 @@ class MancalaWindow(QMainWindow):
         pit_num = drop.index + 1
         return f"{drop.side} pit {pit_num}"
 
-    def _finalize_cache_save_before_close(self) -> None:
-        deadline = time.perf_counter() + (CACHE_CLOSE_SAVE_TIMEOUT_MS / 1000.0)
+    def _finalize_cache_save_before_close(self, timeout_ms: int) -> None:
+        deadline = time.perf_counter() + (max(0, timeout_ms) / 1000.0)
 
         def _remaining_ms() -> int:
             return max(0, int((deadline - time.perf_counter()) * 1000))
 
-        self._update_shutdown_status("Saving cache...", progress=60)
+        self._update_shutdown_status("Finalizing cache save...", progress=60)
         self._poll_cache_save_completion()
-        if self.solver_worker.is_cache_dirty():
-            snapshot_with_counter = self.solver_worker.try_snapshot_cache_with_counter()
+        if self.solver_worker.is_cache_dirty() and not self._cache_save_in_progress():
+            snapshot_budget_ms = min(CACHE_CLOSE_SNAPSHOT_BUDGET_MS, _remaining_ms())
+            snapshot_with_counter = self.solver_worker.try_snapshot_cache_with_counter_budget(snapshot_budget_ms)
             if snapshot_with_counter is not None:
                 snapshot, mutation_counter = snapshot_with_counter
                 self._start_cache_save(snapshot, mutation_counter)
+                self._update_shutdown_status("Saving cache snapshot...", progress=66)
             else:
-                self._update_shutdown_status("Saving cache... waiting for solver lock", progress=62)
+                self._update_shutdown_status(
+                    "Skipping final snapshot (time budget or solver busy).",
+                    progress=84,
+                )
         else:
-            self._update_shutdown_status("Cache already up to date", progress=95)
+            if self.solver_worker.is_cache_dirty():
+                self._update_shutdown_status("Cache save already in progress...", progress=66)
+            else:
+                self._update_shutdown_status("Cache already up to date", progress=95)
 
         self._wait_for_cache_save_completion(
             _remaining_ms(),
@@ -2202,12 +2230,15 @@ class MancalaWindow(QMainWindow):
             self._update_shutdown_status("Stopping solver...", progress=10)
             self.solver_thread.requestInterruption()
             self.solver_thread.quit()
-            stopped = self._wait_for_solver_thread_with_updates(3000, "Stopping solver...")
+            stopped = self._wait_for_solver_thread_with_updates(SOLVER_CLOSE_TIMEOUT_MS, "Stopping solver...")
             if not stopped:
                 self._update_shutdown_status("Force stopping solver...", progress=50)
                 self.solver_thread.terminate()
-                self._wait_for_solver_thread_with_updates(500, "Force stopping solver...")
-            self._finalize_cache_save_before_close()
+                self._wait_for_solver_thread_with_updates(
+                    SOLVER_FORCE_STOP_TIMEOUT_MS,
+                    "Force stopping solver...",
+                )
+            self._finalize_cache_save_before_close(CACHE_CLOSE_SAVE_TIMEOUT_MS)
             self._update_shutdown_status("Finishing...", progress=98)
             self.solver_worker.close()
             self._update_shutdown_status("Closed", progress=100)
