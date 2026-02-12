@@ -21,6 +21,7 @@ from mancala_engine import (
 from mancala_solver import (
     EXACT,
     INF,
+    SearchResult,
     TTEntry,
     _tt_best_move,
     best_move,
@@ -344,6 +345,32 @@ class TestEngine(unittest.TestCase):
         self.assertFalse(result.complete)
         self.assertEqual(result.score, 7)
         self.assertEqual(result.best_move, 2)
+
+    def test_solve_best_move_timeout_preserves_previous_result(self):
+        state = initial_state(seeds=2, you_first=True)
+        previous = SearchResult(
+            best_move=4,
+            score=5,
+            top_moves=[(4, 5), (3, 4)],
+            depth=16,
+            complete=False,
+            elapsed_ms=900,
+            nodes=321_000,
+        )
+        result = solve_best_move(
+            state,
+            topn=3,
+            tt={},
+            time_limit_ms=0,
+            start_depth=17,
+            guess_score=5,
+            previous_result=previous,
+        )
+        self.assertEqual(result.depth, previous.depth)
+        self.assertEqual(result.score, previous.score)
+        self.assertEqual(result.nodes, previous.nodes)
+        self.assertEqual(result.best_move, previous.best_move)
+        self.assertFalse(result.complete)
 
     def test_timeout_returns_last_completed_depth_result(self):
         state = initial_state(seeds=2, you_first=True)

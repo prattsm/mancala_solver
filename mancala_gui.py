@@ -114,7 +114,7 @@ class SolverWorker(QObject):
     def set_latest_request_id(self, request_id: int) -> None:
         self.latest_request_id = request_id
 
-    @Slot(object, int, int, int, object)
+    @Slot(object, int, int, int, object, object)
     def solve(
         self,
         state: State,
@@ -122,6 +122,7 @@ class SolverWorker(QObject):
         request_id: int,
         start_depth: int,
         guess_score: Optional[int],
+        previous_result: Optional[SearchResult],
     ) -> None:
         def _is_interrupted() -> bool:
             if QThread.currentThread().isInterruptionRequested():
@@ -151,6 +152,7 @@ class SolverWorker(QObject):
                     progress_callback=_on_progress,
                     start_depth=start_depth,
                     guess_score=guess_score,
+                    previous_result=previous_result,
                     interrupt_check=_is_interrupted,
                     live_callback=_on_live,
                     telemetry_sink=self.telemetry_sink,
@@ -232,7 +234,7 @@ class StoreWidget(QFrame):
 
 
 class MancalaWindow(QMainWindow):
-    solve_requested = Signal(object, int, int, int, object)
+    solve_requested = Signal(object, int, int, int, object, object)
 
     def __init__(self) -> None:
         super().__init__()
@@ -867,12 +869,14 @@ class MancalaWindow(QMainWindow):
         self.animating = False
         if self.deferred_result_state == self.state and self.deferred_result is not None:
             deferred_result = self.deferred_result
-            self._apply_search_result(deferred_result)
+            if not self._is_regressive_same_state_result(deferred_result):
+                self._apply_search_result(deferred_result)
             self.deferred_result = None
             self.deferred_result_state = None
             self.refresh_ui()
             self._maybe_autoplay(self.solve_request_id)
-            if self._should_requeue_result(deferred_result):
+            result_for_requeue = self.search_progress if self.search_progress is not None else deferred_result
+            if self._should_requeue_result(result_for_requeue):
                 self._queue_requeue_solve()
             return
         self.refresh_ui()
@@ -1348,11 +1352,12 @@ class MancalaWindow(QMainWindow):
             self.update_status()
             return
 
-        has_result_for_state = self.solve_target_state == self.state and self.current_best_move is not None
+        has_result_for_state = self.solve_target_state == self.state and self.search_progress is not None
         if (
             has_result_for_state
             and not self.solving
-            and (self.search_progress is None or self.search_progress.complete)
+            and self.search_progress is not None
+            and self.search_progress.complete
         ):
             self.requeue_pending = False
             self._finish_slice_progress(hide_after_ms=120)
@@ -1373,9 +1378,16 @@ class MancalaWindow(QMainWindow):
                 preserve_progress=True,
                 start_depth=next_depth,
                 guess_score=self.search_progress.score,
+                previous_result=self.search_progress,
             )
         else:
-            self._start_solve_for(self.state, preserve_progress=False, start_depth=1, guess_score=None)
+            self._start_solve_for(
+                self.state,
+                preserve_progress=False,
+                start_depth=1,
+                guess_score=None,
+                previous_result=None,
+            )
 
         self.update_recommendations()
         self.update_status()
@@ -1390,12 +1402,27 @@ class MancalaWindow(QMainWindow):
             and self.solve_target_state == self.state
         )
 
+    def _is_regressive_same_state_result(self, result: SearchResult) -> bool:
+        if self.solve_target_state != self.state:
+            return False
+        previous = self.search_progress
+        if previous is None:
+            return False
+        if previous.complete and not result.complete:
+            return True
+        if result.depth < previous.depth:
+            return True
+        if result.depth == previous.depth and result.nodes == 0 and previous.nodes > 0:
+            return True
+        return False
+
     def _start_solve_for(
         self,
         state: State,
         preserve_progress: bool = False,
         start_depth: int = 1,
         guess_score: Optional[int] = None,
+        previous_result: Optional[SearchResult] = None,
     ) -> None:
         if self.closing:
             return
@@ -1415,7 +1442,14 @@ class MancalaWindow(QMainWindow):
         self.solving = True
         self.active_start_depth = max(1, start_depth)
         self._start_slice_progress()
-        self.solve_requested.emit(state, self.topn, self.solve_request_id, start_depth, guess_score)
+        self.solve_requested.emit(
+            state,
+            self.topn,
+            self.solve_request_id,
+            start_depth,
+            guess_score,
+            previous_result,
+        )
 
     def _apply_search_result(self, result: SearchResult) -> None:
         prev = self.search_progress
@@ -1447,6 +1481,9 @@ class MancalaWindow(QMainWindow):
         if self.animating:
             return
         if self.solve_target_state != self.state:
+            return
+        if self._is_regressive_same_state_result(result):
+            self.update_status()
             return
         self._apply_search_result(result)
         self.update_recommendations()
@@ -1485,6 +1522,11 @@ class MancalaWindow(QMainWindow):
             return
 
         if self.solve_target_state != self.state:
+            return
+        if self._is_regressive_same_state_result(result):
+            self.update_status()
+            if self._should_requeue_result(result):
+                self._queue_requeue_solve()
             return
 
         self._apply_search_result(result)

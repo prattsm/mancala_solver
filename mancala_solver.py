@@ -715,6 +715,7 @@ def solve_best_move(
     progress_callback: Optional[Callable[[SearchResult], None]] = None,
     start_depth: int = 1,
     guess_score: Optional[int] = None,
+    previous_result: Optional[SearchResult] = None,
     interrupt_check: Optional[Callable[[], bool]] = None,
     live_callback: Optional[Callable[[int, int], None]] = None,
     telemetry_sink: Optional[TelemetrySink] = None,
@@ -947,17 +948,38 @@ def solve_best_move(
 
     # Deadline was hit before completing the first requested depth.
     if start_depth > 1 and guess_score is not None:
-        move_guess = _tt_best_move(state, tt)
+        legal = legal_moves(state)
+        move_guess = previous_result.best_move if previous_result is not None else None
+        score_guess = previous_result.score if previous_result is not None else guess_score
+        depth_guess = previous_result.depth if previous_result is not None else (start_depth - 1)
+        nodes_guess = previous_result.nodes if previous_result is not None else 0
+        top_guess = list(previous_result.top_moves) if previous_result is not None else []
+
+        if move_guess not in legal:
+            tt_guess = _tt_best_move(state, tt)
+            if tt_guess in legal:
+                move_guess = tt_guess
+            elif legal:
+                # Keep a usable best-so-far move even when the current slice
+                # timed out before completing one depth.
+                move_guess = legal[0]
+            else:
+                move_guess = None
+
+        if top_guess:
+            top_guess = [(move, score) for move, score in top_guess if move in legal]
+        if not top_guess and move_guess is not None:
+            top_guess = [(move_guess, score_guess)]
+
         elapsed_ms = int((time.perf_counter() - start) * 1000)
-        top_guess = [(move_guess, guess_score)] if move_guess is not None else []
         result = SearchResult(
             best_move=move_guess,
-            score=guess_score,
+            score=score_guess,
             top_moves=top_guess,
-            depth=start_depth - 1,
+            depth=max(0, depth_guess),
             complete=False,
             elapsed_ms=elapsed_ms,
-            nodes=0,
+            nodes=max(0, nodes_guess),
         )
         _emit_search_end(result, "timeout")
         return result

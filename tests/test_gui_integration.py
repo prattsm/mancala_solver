@@ -171,6 +171,62 @@ class TestGUIIntegration(unittest.TestCase):
         self.assertEqual(self.window.search_progress.depth, 2)
         self.assertFalse(self.window.search_progress.complete)
 
+    def test_schedule_preserves_progress_even_if_best_move_is_none(self) -> None:
+        self.window.search_progress = SearchResult(
+            best_move=None,
+            score=2,
+            top_moves=[],
+            depth=7,
+            complete=False,
+            elapsed_ms=30,
+            nodes=500,
+        )
+        self.window.current_best_move = None
+        self.window.solve_target_state = self.window.state
+        self.window.solving = False
+
+        spy = QSignalSpy(self.window.solve_requested)
+        self.window.schedule_solve_if_needed()
+
+        self.assertTrue(spy.wait(1000))
+        args = spy[0]
+        self.assertEqual(args[3], 8)
+        self.assertEqual(args[4], 2)
+        self.assertIsNotNone(args[5])
+
+    def test_regressive_same_state_result_does_not_replace_progress(self) -> None:
+        previous = SearchResult(
+            best_move=4,
+            score=5,
+            top_moves=[(4, 5), (3, 4)],
+            depth=16,
+            complete=False,
+            elapsed_ms=800,
+            nodes=240000,
+        )
+        self.window.search_progress = previous
+        self.window.current_best_move = previous.best_move
+        self.window.current_best_eval = previous.score
+        self.window.current_top_moves = list(previous.top_moves)
+        self.window.solve_target_state = self.window.state
+        self.window.solving = True
+        request_id = self.window.solve_request_id
+
+        regressive = SearchResult(
+            best_move=None,
+            score=5,
+            top_moves=[],
+            depth=13,
+            complete=False,
+            elapsed_ms=805,
+            nodes=0,
+        )
+        self.window.on_solve_result(request_id, regressive)
+
+        self.assertIsNotNone(self.window.search_progress)
+        self.assertEqual(self.window.search_progress.depth, 16)
+        self.assertEqual(self.window.current_best_move, 4)
+
     def test_close_event_uses_bounded_wait_and_terminate_fallback(self) -> None:
         self.window.solver_thread.wait_results = [False, True]
         event = QCloseEvent()
