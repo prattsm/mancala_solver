@@ -65,10 +65,10 @@ from mancala_engine import (
 from mancala_solver import SearchResult, default_cache_path, load_tt, save_tt, solve_best_move
 from mancala_telemetry import ThreadedTCPSink, parse_host_port
 
-SOLVE_SLICE_MS = 250
-SOLVE_SLICE_MS_FAST = 100
-SOLVE_FAST_SLICES_AFTER_STATE_CHANGE = 2
-SOLVE_REQUEUE_DELAY_MS = 50
+SOLVE_SLICE_MS = 150
+SOLVE_SLICE_MS_FAST = 60
+SOLVE_FAST_SLICES_AFTER_STATE_CHANGE = 4
+SOLVE_REQUEUE_DELAY_MS = 15
 CACHE_AUTOSAVE_CHECK_MS = 1000
 CACHE_AUTOSAVE_INTERVAL_MS = 60_000
 CACHE_AUTOSAVE_IDLE_MS = 5_000
