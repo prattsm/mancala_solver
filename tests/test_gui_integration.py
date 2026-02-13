@@ -18,41 +18,6 @@ except Exception:
 
 
 if HAS_QT:
-    class _DummyThread:
-        def __init__(self) -> None:
-            self.wait_results = [True]
-            self.wait_calls = []
-            self.requested_interruption = False
-            self.quit_called = False
-            self.terminate_called = False
-            self.running = True
-            self.running_script = []
-
-        def requestInterruption(self) -> None:
-            self.requested_interruption = True
-
-        def isInterruptionRequested(self) -> bool:
-            return self.requested_interruption
-
-        def isRunning(self) -> bool:
-            if self.running_script:
-                return self.running_script.pop(0)
-            return self.running
-
-        def quit(self) -> None:
-            self.quit_called = True
-
-        def wait(self, timeout: int) -> bool:
-            self.wait_calls.append(timeout)
-            if self.wait_results:
-                return self.wait_results.pop(0)
-            return True
-
-        def terminate(self) -> None:
-            self.terminate_called = True
-            self.running = False
-
-
     class _DummyWorker:
         def __init__(self) -> None:
             self.latest_request_id = 0
@@ -61,6 +26,11 @@ if HAS_QT:
             self.try_snapshot_calls = 0
             self.tt_mutation_counter = 0
             self.tt_saved_counter = 0
+            self.shutdown_calls = []
+            self.shutdown_result = True
+            self.wait_for_idle_calls = []
+            self.wait_for_idle_result = True
+            self.closed = False
 
         def set_latest_request_id(self, request_id: int) -> None:
             self.latest_request_id = request_id
@@ -108,12 +78,19 @@ if HAS_QT:
             if mutation_counter > self.tt_saved_counter:
                 self.tt_saved_counter = mutation_counter
 
+        def shutdown(self, timeout_ms: int) -> bool:
+            self.shutdown_calls.append(timeout_ms)
+            return self.shutdown_result
+
+        def wait_for_idle(self, timeout_ms: int) -> bool:
+            self.wait_for_idle_calls.append(timeout_ms)
+            return self.wait_for_idle_result
+
         def close(self) -> None:
-            return
+            self.closed = True
 
 
     def _fake_setup_solver(window: "gui_mod.MancalaWindow") -> None:
-        window.solver_thread = _DummyThread()
         window.solver_worker = _DummyWorker()
         window.solver_worker.set_latest_request_id(window.solve_request_id)
         window.solve_requested.connect(window.solver_worker.solve)
@@ -287,17 +264,16 @@ class TestGUIIntegration(unittest.TestCase):
         self.assertEqual(self.window.search_progress.depth, 16)
         self.assertEqual(self.window.current_best_move, 4)
 
-    def test_close_event_uses_bounded_wait_and_terminate_fallback(self) -> None:
-        self.window.solver_thread.running_script = [True] * 128
+    def test_close_event_uses_bounded_solver_shutdown(self) -> None:
         self.window.solver_worker.tt_mutation_counter = 1
         event = QCloseEvent()
 
         self.window.closeEvent(event)
 
-        self.assertTrue(self.window.solver_thread.requested_interruption)
-        self.assertTrue(self.window.solver_thread.quit_called)
-        self.assertTrue(self.window.solver_thread.terminate_called)
+        self.assertEqual(self.window.solver_worker.wait_for_idle_calls, [gui_mod.SOLVER_CLOSE_TIMEOUT_MS])
+        self.assertEqual(self.window.solver_worker.shutdown_calls, [gui_mod.SOLVER_CLOSE_TIMEOUT_MS, 0])
         self.assertEqual(self.window.solver_worker.tt_saved_counter, 1)
+        self.assertTrue(self.window.solver_worker.closed)
         self.window = None
 
     def test_close_event_skips_save_when_not_dirty(self) -> None:
@@ -306,7 +282,36 @@ class TestGUIIntegration(unittest.TestCase):
         event = QCloseEvent()
         self.window.closeEvent(event)
 
+        self.assertEqual(self.window.solver_worker.wait_for_idle_calls, [gui_mod.SOLVER_CLOSE_TIMEOUT_MS])
+        self.assertEqual(self.window.solver_worker.shutdown_calls, [gui_mod.SOLVER_CLOSE_TIMEOUT_MS, 0])
         self.assertEqual(self.window.solver_worker.tt_saved_counter, 0)
+        self.assertTrue(self.window.solver_worker.closed)
+        self.window = None
+
+    def test_close_event_skips_final_save_when_solver_shutdown_fails(self) -> None:
+        self.window.solver_worker.wait_for_idle_result = False
+        self.window.solver_worker.shutdown_result = False
+        self.window.solver_worker.tt_mutation_counter = 3
+        event = QCloseEvent()
+        self.window.closeEvent(event)
+
+        self.assertEqual(self.window.solver_worker.wait_for_idle_calls, [gui_mod.SOLVER_CLOSE_TIMEOUT_MS])
+        self.assertEqual(self.window.solver_worker.shutdown_calls, [gui_mod.SOLVER_CLOSE_TIMEOUT_MS, 0])
+        self.assertEqual(self.window.solver_worker.tt_saved_counter, 0)
+        self.assertTrue(self.window.solver_worker.closed)
+        self.window = None
+
+    def test_state_change_requeues_solver_quickly(self) -> None:
+        committed_state = self._prepare_pending_extra_turn()
+        self.window.solve_target_state = committed_state
+        self.window.solving = False
+        spy = QSignalSpy(self.window.solve_requested)
+
+        self.window.commit_pending_move()
+
+        self.assertTrue(spy.wait(250))
+        args = spy[0]
+        self.assertEqual(args[0], committed_state)
         self.window = None
 
 

@@ -603,10 +603,12 @@ def _search_depth(
 
     best_move: Optional[int] = None
     best_proven = False
+    all_children_proven = True
     if state.to_move == YOU:
         best = -INF
         for move, child_state, _, _, _ in children:
             val, val_proven = _search_depth(child_state, alpha, beta, depth - 1, context)
+            all_children_proven = all_children_proven and val_proven
             if val > best or (val == best and val_proven and not best_proven):
                 best = val
                 best_move = move
@@ -619,6 +621,7 @@ def _search_depth(
         best = INF
         for move, child_state, _, _, _ in children:
             val, val_proven = _search_depth(child_state, alpha, beta, depth - 1, context)
+            all_children_proven = all_children_proven and val_proven
             if val < best or (val == best and val_proven and not best_proven):
                 best = val
                 best_move = move
@@ -640,7 +643,7 @@ def _search_depth(
 
     value_norm, flag_norm = normalize_value_flag(best, flag, sign)
     best_move_norm = normalize_move(best_move, sign)
-    exact_proven = best_proven if flag == EXACT else False
+    exact_proven = all_children_proven if flag == EXACT else False
     if context.telemetry is not None:
         context.telemetry.tt_stores += 1
     _tt_store(

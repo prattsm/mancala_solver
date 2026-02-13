@@ -4,9 +4,7 @@ from __future__ import annotations
 
 import sys
 import multiprocessing as mp
-import threading
 import time
-import traceback
 import os
 import queue
 from dataclasses import dataclass
@@ -22,7 +20,6 @@ from PySide6.QtCore import (
     QSequentialAnimationGroup,
     Qt,
     QObject,
-    QThread,
     Signal,
     Slot,
     QSettings,
@@ -77,8 +74,6 @@ CACHE_CLOSE_SAVE_TIMEOUT_MS = 1_200
 CACHE_CLOSE_SNAPSHOT_BUDGET_MS = 120
 CACHE_SAVE_POLL_MS = 20
 SOLVER_CLOSE_TIMEOUT_MS = 3_000
-SOLVER_FORCE_STOP_TIMEOUT_MS = 500
-SOLVER_CLOSE_POLL_MS = 50
 SETTINGS_ORG = "prattsm"
 SETTINGS_APP = "mancala_solver"
 
@@ -133,6 +128,125 @@ def _cache_save_worker(requests: "mp.Queue[Optional[Tuple[str, dict, int]]]", re
                 pass
 
 
+def _solver_process_worker(
+    commands: "mp.Queue[dict]",
+    events: "mp.Queue[tuple]",
+    latest_request_id: "mp.Value",
+    telemetry_endpoint: Optional[Tuple[str, int]],
+) -> None:
+    tt: dict = {}
+    tt_mutation_counter = 0
+    telemetry_sink: Optional[ThreadedTCPSink] = None
+    if telemetry_endpoint is not None:
+        telemetry_sink = ThreadedTCPSink(telemetry_endpoint[0], telemetry_endpoint[1])
+
+    def _put_event(event: tuple) -> None:
+        try:
+            events.put_nowait(event)
+        except queue.Full:
+            return
+
+    def _is_interrupted(request_id: int) -> bool:
+        return request_id != latest_request_id.value
+
+    def _record_tt_mutation() -> None:
+        nonlocal tt_mutation_counter
+        tt_mutation_counter += 1
+
+    try:
+        while True:
+            cmd = commands.get()
+            cmd_type = cmd.get("type")
+            if cmd_type == "shutdown":
+                break
+            if cmd_type == "set_cache":
+                raw_tt = cmd.get("tt")
+                if isinstance(raw_tt, dict):
+                    tt = dict(raw_tt)
+                    tt_mutation_counter = 0
+                _put_event(("cache_reset", tt_mutation_counter))
+                continue
+            if cmd_type == "snapshot":
+                token = int(cmd.get("token", 0))
+                max_entries = cmd.get("max_entries")
+                budget_ms = int(cmd.get("budget_ms", 0))
+                deadline = None
+                if budget_ms > 0:
+                    deadline = time.perf_counter() + (budget_ms / 1000.0)
+                snapshot: Optional[dict]
+                if max_entries is None or max_entries <= 0 or len(tt) <= max_entries:
+                    if deadline is None:
+                        snapshot = dict(tt)
+                    else:
+                        snapshot = {}
+                        for idx, (state, entry) in enumerate(tt.items()):
+                            snapshot[state] = entry
+                            if (idx & 0xFF) == 0 and time.perf_counter() >= deadline:
+                                snapshot = None
+                                break
+                else:
+                    snapshot = {}
+                    for idx, (state, entry) in enumerate(tt.items()):
+                        if idx >= max_entries:
+                            break
+                        snapshot[state] = entry
+                        if deadline is not None and (idx & 0xFF) == 0 and time.perf_counter() >= deadline:
+                            snapshot = None
+                            break
+                _put_event(("snapshot", token, snapshot, tt_mutation_counter))
+                continue
+            if cmd_type == "solve":
+                request_id = int(cmd.get("request_id", 0))
+                state = cmd.get("state")
+                if not isinstance(state, State):
+                    _put_event(("error", request_id, "Invalid solve state payload"))
+                    continue
+                topn = int(cmd.get("topn", 3))
+                start_depth = int(cmd.get("start_depth", 1))
+                guess_score = cmd.get("guess_score")
+                previous_result = cmd.get("previous_result")
+                slice_ms = max(1, int(cmd.get("slice_ms", SOLVE_SLICE_MS)))
+
+                def _on_progress(result: SearchResult) -> None:
+                    if _is_interrupted(request_id):
+                        raise InterruptedError()
+                    _put_event(("progress", request_id, result, tt_mutation_counter))
+
+                def _on_live(nodes: int, elapsed_ms: int) -> None:
+                    if _is_interrupted(request_id):
+                        raise InterruptedError()
+                    _put_event(("live", request_id, int(nodes), int(elapsed_ms), tt_mutation_counter))
+
+                try:
+                    result = solve_best_move(
+                        state,
+                        topn=topn,
+                        tt=tt,
+                        time_limit_ms=slice_ms,
+                        progress_callback=_on_progress,
+                        start_depth=start_depth,
+                        guess_score=guess_score,
+                        previous_result=previous_result,
+                        interrupt_check=lambda rid=request_id: _is_interrupted(rid),
+                        tt_mutation_callback=_record_tt_mutation,
+                        live_callback=_on_live,
+                        telemetry_sink=telemetry_sink,
+                    )
+                except InterruptedError:
+                    continue
+                except Exception as exc:
+                    if _is_interrupted(request_id):
+                        continue
+                    _put_event(("error", request_id, f"{type(exc).__name__}: {exc}"))
+                    continue
+                if _is_interrupted(request_id):
+                    continue
+                _put_event(("result", request_id, result, tt_mutation_counter))
+    finally:
+        if telemetry_sink is not None:
+            telemetry_sink.close()
+
+
 class SolverWorker(QObject):
     result_ready = Signal(int, object)
     progress = Signal(int, object)
@@ -141,22 +255,160 @@ class SolverWorker(QObject):
 
     def __init__(self) -> None:
         super().__init__()
-        self.tt = {}
-        self.tt_lock = threading.Lock()
         self.latest_request_id = 0
         self.tt_mutation_counter = 0
         self.tt_saved_counter = 0
-        self.telemetry_sink: Optional[ThreadedTCPSink] = None
+        self._cache_size_estimate = 0
+        self._rpc_token = 0
+        self._pending_snapshots: dict[int, Tuple[Optional[dict], int]] = {}
+        self._command_queue: "mp.Queue[dict]" = mp.Queue()
+        self._event_queue: "mp.Queue[tuple]" = mp.Queue(maxsize=512)
+        self._latest_request_id_value = mp.Value("i", 0, lock=False)
+        self._process: Optional[mp.Process] = None
+        self._active_request_id: Optional[int] = None
+        self._closed = False
+        self._allow_process_restart = True
+        self._event_timer = QTimer(self)
+        self._event_timer.setInterval(10)
+        self._event_timer.timeout.connect(self._drain_events)
+        self._event_timer.start()
+        self._telemetry_endpoint: Optional[Tuple[str, int]] = None
         endpoint_raw = os.environ.get("MANCALA_TELEMETRY", "").strip()
         endpoint = parse_host_port(endpoint_raw) if endpoint_raw else None
         if endpoint is not None:
-            self.telemetry_sink = ThreadedTCPSink(endpoint[0], endpoint[1])
+            self._telemetry_endpoint = endpoint
+
+    def _ensure_process(self) -> bool:
+        if self._closed:
+            return False
+        if self._process is not None and self._process.is_alive():
+            return True
+        if not self._allow_process_restart:
+            return False
+        if self._process is not None:
+            self._process.join(timeout=0.05)
+            self._process = None
+        try:
+            process = mp.Process(
+                target=_solver_process_worker,
+                args=(
+                    self._command_queue,
+                    self._event_queue,
+                    self._latest_request_id_value,
+                    self._telemetry_endpoint,
+                ),
+                name="mancala-solver",
+                daemon=True,
+            )
+            process.start()
+        except Exception:
+            self._process = None
+            return False
+        self._process = process
+        return True
+
+    def _next_rpc_token(self) -> int:
+        self._rpc_token += 1
+        return self._rpc_token
+
+    def _send_command(self, cmd: dict) -> bool:
+        if not self._ensure_process():
+            return False
+        try:
+            self._command_queue.put_nowait(cmd)
+            return True
+        except queue.Full:
+            try:
+                self._command_queue.put(cmd, timeout=0.05)
+                return True
+            except Exception:
+                return False
+
+    def _drain_events(self) -> None:
+        while True:
+            try:
+                event = self._event_queue.get_nowait()
+            except queue.Empty:
+                break
+
+            kind = event[0] if event else None
+            if kind == "progress":
+                _, request_id, result, mutation_counter = event
+                self.tt_mutation_counter = max(self.tt_mutation_counter, int(mutation_counter))
+                self.progress.emit(int(request_id), result)
+                continue
+            if kind == "live":
+                _, request_id, nodes, elapsed_ms, mutation_counter = event
+                self.tt_mutation_counter = max(self.tt_mutation_counter, int(mutation_counter))
+                self.live_metrics.emit(int(request_id), int(nodes), int(elapsed_ms))
+                continue
+            if kind == "result":
+                _, request_id, result, mutation_counter = event
+                self.tt_mutation_counter = max(self.tt_mutation_counter, int(mutation_counter))
+                if self._active_request_id == int(request_id):
+                    self._active_request_id = None
+                self.result_ready.emit(int(request_id), result)
+                continue
+            if kind == "error":
+                _, request_id, text = event
+                if self._active_request_id == int(request_id):
+                    self._active_request_id = None
+                self.solve_failed.emit(int(request_id), str(text))
+                continue
+            if kind == "snapshot":
+                _, token, snapshot, mutation_counter = event
+                self.tt_mutation_counter = max(self.tt_mutation_counter, int(mutation_counter))
+                self._pending_snapshots[int(token)] = (snapshot, int(mutation_counter))
+                if snapshot is not None:
+                    self._cache_size_estimate = len(snapshot)
+                continue
+            if kind == "cache_reset":
+                _, mutation_counter = event
+                self.tt_mutation_counter = int(mutation_counter)
+                self.tt_saved_counter = int(mutation_counter)
+                self._cache_size_estimate = 0
+                continue
 
     def set_latest_request_id(self, request_id: int) -> None:
         self.latest_request_id = request_id
+        self._latest_request_id_value.value = int(request_id)
+        if self._active_request_id is not None and self._active_request_id != int(request_id):
+            self._active_request_id = None
 
-    def _record_tt_mutation(self) -> None:
-        self.tt_mutation_counter += 1
+    def wait_for_idle(self, timeout_ms: int) -> bool:
+        deadline = time.perf_counter() + (max(0, timeout_ms) / 1000.0)
+        while time.perf_counter() < deadline:
+            self._drain_events()
+            if self._active_request_id is None:
+                return True
+            time.sleep(0.01)
+        self._drain_events()
+        return self._active_request_id is None
+
+    def _request_snapshot(self, budget_ms: int) -> Optional[Tuple[dict, int]]:
+        if not self._ensure_process():
+            return None
+        token = self._next_rpc_token()
+        if not self._send_command({"type": "snapshot", "token": token, "budget_ms": max(0, int(budget_ms))}):
+            return None
+        deadline = time.perf_counter() + (max(0, budget_ms) / 1000.0)
+        while time.perf_counter() <= deadline:
+            self._drain_events()
+            payload = self._pending_snapshots.pop(token, None)
+            if payload is not None:
+                snapshot, mutation_counter = payload
+                if snapshot is None:
+                    return None
+                return snapshot, mutation_counter
+            time.sleep(0.002)
+        self._drain_events()
+        payload = self._pending_snapshots.pop(token, None)
+        if payload is None:
+            return None
+        snapshot, mutation_counter = payload
+        if snapshot is None:
+            return None
+        return snapshot, mutation_counter
 
     @Slot(object, int, int, int, object, object, int)
     def solve(
@@ -169,113 +421,86 @@ class SolverWorker(QObject):
         previous_result: Optional[SearchResult],
         slice_ms: int,
     ) -> None:
-        def _is_interrupted() -> bool:
-            if QThread.currentThread().isInterruptionRequested():
-                return True
-            return request_id != self.latest_request_id
-
-        if _is_interrupted():
+        if request_id != self.latest_request_id:
             return
-
-        def _on_progress(result: SearchResult) -> None:
-            if _is_interrupted():
-                raise InterruptedError()
-            self.progress.emit(request_id, result)
-
-        def _on_live(nodes: int, elapsed_ms: int) -> None:
-            if _is_interrupted():
-                raise InterruptedError()
-            self.live_metrics.emit(request_id, nodes, elapsed_ms)
-
-        try:
-            with self.tt_lock:
-                result = solve_best_move(
-                    state,
-                    topn=topn,
-                    tt=self.tt,
-                    time_limit_ms=max(1, slice_ms),
-                    progress_callback=_on_progress,
-                    start_depth=start_depth,
-                    guess_score=guess_score,
-                    previous_result=previous_result,
-                    interrupt_check=_is_interrupted,
-                    tt_mutation_callback=self._record_tt_mutation,
-                    live_callback=_on_live,
-                    telemetry_sink=self.telemetry_sink,
-                )
-        except InterruptedError:
+        if not self._send_command(
+            {
+                "type": "solve",
+                "state": state,
+                "topn": int(topn),
+                "request_id": int(request_id),
+                "start_depth": int(start_depth),
+                "guess_score": guess_score,
+                "previous_result": previous_result,
+                "slice_ms": max(1, int(slice_ms)),
+            }
+        ):
+            self.solve_failed.emit(request_id, "Failed to start solver process")
             return
-        except Exception as exc:
-            traceback.print_exc()
-            if _is_interrupted():
-                return
-            self.solve_failed.emit(request_id, f"{type(exc).__name__}: {exc}")
-            return
-
-        if _is_interrupted():
-            return
-        self.result_ready.emit(request_id, result)
+        self._active_request_id = int(request_id)
 
     def set_cache(self, tt) -> None:
-        with self.tt_lock:
-            self.tt = tt
+        if not isinstance(tt, dict):
+            tt = {}
+        if not self._send_command({"type": "set_cache", "tt": dict(tt)}):
+            self.solve_failed.emit(self.latest_request_id, "Failed to initialize solver cache")
+            return
+        self._cache_size_estimate = len(tt)
         self.tt_mutation_counter = 0
         self.tt_saved_counter = 0
 
     def cache_size(self) -> int:
-        with self.tt_lock:
-            return len(self.tt)
-
-    def _snapshot_cache_locked(self, max_entries: Optional[int] = None) -> dict:
-        if max_entries is None or max_entries <= 0 or len(self.tt) <= max_entries:
-            return dict(self.tt)
-        snapshot = {}
-        for idx, (state, entry) in enumerate(self.tt.items()):
-            if idx >= max_entries:
-                break
-            snapshot[state] = entry
-        return snapshot
+        snapshot_with_counter = self.try_snapshot_cache_with_counter_budget(40)
+        if snapshot_with_counter is not None:
+            snapshot, _ = snapshot_with_counter
+            self._cache_size_estimate = len(snapshot)
+        return self._cache_size_estimate
 
     def snapshot_cache(self, max_entries: Optional[int] = None) -> dict:
-        with self.tt_lock:
-            return self._snapshot_cache_locked(max_entries=max_entries)
+        snapshot_with_counter = self.snapshot_cache_with_counter()
+        if snapshot_with_counter is None:
+            return {}
+        snapshot, _ = snapshot_with_counter
+        if max_entries is None or max_entries <= 0 or len(snapshot) <= max_entries:
+            return snapshot
+        limited = {}
+        for idx, (state, entry) in enumerate(snapshot.items()):
+            if idx >= max_entries:
+                break
+            limited[state] = entry
+        return limited
 
     def snapshot_cache_with_counter(self) -> Tuple[dict, int]:
-        with self.tt_lock:
-            return dict(self.tt), self.tt_mutation_counter
+        snapshot_with_counter = self._request_snapshot(5_000)
+        if snapshot_with_counter is None:
+            return {}, self.tt_mutation_counter
+        return snapshot_with_counter
 
     def try_snapshot_cache_with_counter(self) -> Optional[Tuple[dict, int]]:
-        if not self.tt_lock.acquire(blocking=False):
+        if self._active_request_id is not None:
             return None
-        try:
-            return dict(self.tt), self.tt_mutation_counter
-        finally:
-            self.tt_lock.release()
+        return self._request_snapshot(20)
 
     def try_snapshot_cache_with_counter_budget(self, budget_ms: int) -> Optional[Tuple[dict, int]]:
         if budget_ms <= 0:
             return None
-        if not self.tt_lock.acquire(blocking=False):
+        if self._active_request_id is not None:
             return None
-        deadline = time.perf_counter() + (budget_ms / 1000.0)
-        try:
-            snapshot: dict = {}
-            mutation_counter = self.tt_mutation_counter
-            for idx, (state, entry) in enumerate(self.tt.items()):
-                snapshot[state] = entry
-                if (idx & 0xFF) == 0 and time.perf_counter() >= deadline:
-                    return None
-            return snapshot, mutation_counter
-        finally:
-            self.tt_lock.release()
+        return self._request_snapshot(budget_ms)
 
     def try_snapshot_cache(self, max_entries: Optional[int] = None) -> Optional[dict]:
-        if not self.tt_lock.acquire(blocking=False):
+        snapshot_with_counter = self.try_snapshot_cache_with_counter()
+        if snapshot_with_counter is None:
             return None
-        try:
-            return self._snapshot_cache_locked(max_entries=max_entries)
-        finally:
-            self.tt_lock.release()
+        snapshot, _ = snapshot_with_counter
+        if max_entries is None or max_entries <= 0 or len(snapshot) <= max_entries:
+            return snapshot
+        limited = {}
+        for idx, (state, entry) in enumerate(snapshot.items()):
+            if idx >= max_entries:
+                break
+            limited[state] = entry
+        return limited
 
     def is_cache_dirty(self) -> bool:
         return self.tt_mutation_counter != self.tt_saved_counter
@@ -284,9 +509,25 @@ class SolverWorker(QObject):
         if mutation_counter > self.tt_saved_counter:
             self.tt_saved_counter = mutation_counter
 
+    def shutdown(self, timeout_ms: int) -> bool:
+        self._allow_process_restart = False
+        self._active_request_id = None
+        process = self._process
+        if process is None:
+            return True
+        self._event_timer.stop()
+        self._send_command({"type": "shutdown"})
+        process.join(timeout=max(0, timeout_ms) / 1000.0)
+        if process.is_alive():
+            process.terminate()
+            process.join(timeout=0.25)
+        stopped = not process.is_alive()
+        self._process = None
+        return stopped
+
     def close(self) -> None:
-        if self.telemetry_sink is not None:
-            self.telemetry_sink.close()
+        self.shutdown(0)
+        self._closed = True
 
 
 class PitButton(QPushButton):
@@ -609,17 +850,14 @@ class MancalaWindow(QMainWindow):
         self.overlay.raise_()
 
     def _setup_solver(self) -> None:
-        self.solver_thread = QThread(self)
         self.solver_worker = SolverWorker()
         self.solver_worker.set_latest_request_id(self.solve_request_id)
         self.solver_worker.set_cache(load_tt(self.cache_path))
-        self.solver_worker.moveToThread(self.solver_thread)
         self.solve_requested.connect(self.solver_worker.solve)
         self.solver_worker.progress.connect(self.on_solve_progress)
         self.solver_worker.live_metrics.connect(self.on_solve_live)
         self.solver_worker.result_ready.connect(self.on_solve_result)
         self.solver_worker.solve_failed.connect(self.on_solve_failed)
-        self.solver_thread.start()
 
     def _set_latest_request_id(self) -> None:
         if hasattr(self, "solver_worker"):
@@ -765,19 +1003,6 @@ class MancalaWindow(QMainWindow):
         self.shutdown_dialog = None
         self.shutdown_label = None
         self.shutdown_progress = None
-
-    def _wait_for_solver_thread_with_updates(self, timeout_ms: int, phase_text: str) -> bool:
-        deadline = time.perf_counter() + (max(0, timeout_ms) / 1000.0)
-        while True:
-            if not self.solver_thread.isRunning():
-                return True
-            remaining_ms = int((deadline - time.perf_counter()) * 1000)
-            if remaining_ms <= 0:
-                return not self.solver_thread.isRunning()
-            elapsed_s = (timeout_ms - remaining_ms) / 1000.0
-            progress = 10 + int(((timeout_ms - remaining_ms) / max(1, timeout_ms)) * 35)
-            self._update_shutdown_status(f"{phase_text} ({elapsed_s:.1f}s)", progress=progress)
-            time.sleep(SOLVER_CLOSE_POLL_MS / 1000.0)
 
     def _ensure_cache_save_worker(self) -> bool:
         process = self.cache_save_process
@@ -2276,26 +2501,17 @@ class MancalaWindow(QMainWindow):
             pass
         try:
             self._update_shutdown_status("Stopping solver...", progress=10)
-            self.solver_thread.requestInterruption()
-            self.solver_thread.quit()
-            stopped = self._wait_for_solver_thread_with_updates(SOLVER_CLOSE_TIMEOUT_MS, "Stopping solver...")
-            if not stopped:
-                self._update_shutdown_status("Force stopping solver...", progress=50)
-                self.solver_thread.terminate()
-                stopped = self._wait_for_solver_thread_with_updates(
-                    SOLVER_FORCE_STOP_TIMEOUT_MS,
-                    "Force stopping solver...",
-                )
-            if stopped:
+            idle = self.solver_worker.wait_for_idle(SOLVER_CLOSE_TIMEOUT_MS)
+            if idle:
                 self._finalize_cache_save_before_close(CACHE_CLOSE_SAVE_TIMEOUT_MS)
             else:
-                self._update_shutdown_status("Solver did not stop; skipping final cache save", progress=88)
+                self._update_shutdown_status("Solver still busy; skipping final cache save", progress=88)
+            stopped = self.solver_worker.shutdown(SOLVER_CLOSE_TIMEOUT_MS)
+            if not stopped:
+                self._update_shutdown_status("Solver did not stop cleanly", progress=94)
             self._update_shutdown_status("Finishing...", progress=98)
             self.solver_worker.close()
             self._update_shutdown_status("Closed", progress=100)
-            if self.solver_thread.isRunning():
-                self._pump_ui_events()
-                os._exit(0)
         finally:
             self._hide_shutdown_dialog()
         super().closeEvent(event)

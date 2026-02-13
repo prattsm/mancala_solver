@@ -5,7 +5,14 @@ CLI and desktop GUI that recommend the best move for GamePigeon Mancala in Captu
 ## Setup
 - Python 3.9+ recommended
 - CLI: no external dependencies
-- GUI: `pip install pyside6`
+- GUI (recommended in a virtualenv; avoids PEP 668/system package conflicts):
+
+```bash
+python3 -m venv .venv
+source .venv/bin/activate
+python -m pip install --upgrade pip
+python -m pip install pyside6
+```
 
 ## Run (CLI)
 ```bash

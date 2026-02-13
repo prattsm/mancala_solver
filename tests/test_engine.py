@@ -440,6 +440,21 @@ class TestEngine(unittest.TestCase):
         result = solve_best_move(state, topn=3, tt=tt, time_limit_ms=200, start_depth=2)
         self.assertFalse(result.complete)
 
+    def test_depth_limited_exact_entry_is_not_marked_proven(self):
+        state = make_state(YOU, [2, 2, 0, 0, 0, 0], [1, 2, 0, 0, 2, 0], 11, 16)
+        tt = {}
+        solver_mod.search_depth(state, depth=2, tt=tt)
+        norm_state, _ = solver_mod.normalize_state(state)
+        entry = tt.get(norm_state)
+        self.assertIsNotNone(entry)
+        self.assertEqual(entry.flag, EXACT)
+        self.assertFalse(entry.proven)
+
+        context = solver_mod._SearchContext(tt=tt, deadline=None)
+        _, proven = solver_mod._search_depth(state, -solver_mod.INF, solver_mod.INF, 2, context)
+        self.assertFalse(proven)
+        self.assertTrue(context.used_unproven_tt)
+
     def test_full_solve_interrupt_returns_partial_result(self):
         state = initial_state(seeds=4, you_first=True)
         result = solve_best_move(
