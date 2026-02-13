@@ -65,11 +65,14 @@ from mancala_engine import (
 from mancala_solver import SearchResult, default_cache_path, load_tt, save_tt, solve_best_move
 from mancala_telemetry import ThreadedTCPSink, parse_host_port
 
-SOLVE_SLICE_MS = 500
+SOLVE_SLICE_MS = 250
+SOLVE_SLICE_MS_FAST = 100
+SOLVE_FAST_SLICES_AFTER_STATE_CHANGE = 2
 SOLVE_REQUEUE_DELAY_MS = 50
 CACHE_AUTOSAVE_CHECK_MS = 1000
-CACHE_AUTOSAVE_INTERVAL_MS = 20_000
-CACHE_AUTOSAVE_IDLE_MS = 2_000
+CACHE_AUTOSAVE_INTERVAL_MS = 60_000
+CACHE_AUTOSAVE_IDLE_MS = 5_000
+CACHE_AUTOSAVE_SNAPSHOT_BUDGET_MS = 120
 CACHE_CLOSE_SAVE_TIMEOUT_MS = 1_200
 CACHE_CLOSE_SNAPSHOT_BUDGET_MS = 120
 CACHE_SAVE_POLL_MS = 20
@@ -154,7 +157,7 @@ class SolverWorker(QObject):
     def _record_tt_mutation(self) -> None:
         self.tt_mutation_counter += 1
 
-    @Slot(object, int, int, int, object, object)
+    @Slot(object, int, int, int, object, object, int)
     def solve(
         self,
         state: State,
@@ -163,6 +166,7 @@ class SolverWorker(QObject):
         start_depth: int,
         guess_score: Optional[int],
         previous_result: Optional[SearchResult],
+        slice_ms: int,
     ) -> None:
         def _is_interrupted() -> bool:
             if QThread.currentThread().isInterruptionRequested():
@@ -188,7 +192,7 @@ class SolverWorker(QObject):
                     state,
                     topn=topn,
                     tt=self.tt,
-                    time_limit_ms=SOLVE_SLICE_MS,
+                    time_limit_ms=max(1, slice_ms),
                     progress_callback=_on_progress,
                     start_depth=start_depth,
                     guess_score=guess_score,
@@ -258,7 +262,7 @@ class SolverWorker(QObject):
             mutation_counter = self.tt_mutation_counter
             for idx, (state, entry) in enumerate(self.tt.items()):
                 snapshot[state] = entry
-                if (idx & 0x3FF) == 0 and time.perf_counter() >= deadline:
+                if (idx & 0xFF) == 0 and time.perf_counter() >= deadline:
                     return None
             return snapshot, mutation_counter
         finally:
@@ -327,7 +331,7 @@ class StoreWidget(QFrame):
 
 
 class MancalaWindow(QMainWindow):
-    solve_requested = Signal(object, int, int, int, object, object)
+    solve_requested = Signal(object, int, int, int, object, object, int)
 
     def __init__(self) -> None:
         super().__init__()
@@ -362,6 +366,8 @@ class MancalaWindow(QMainWindow):
         self.slice_start_time: Optional[float] = None
         self.slice_hide_token = 0
         self.active_start_depth = 1
+        self.active_slice_ms = SOLVE_SLICE_MS
+        self.fast_slices_remaining = SOLVE_FAST_SLICES_AFTER_STATE_CHANGE
         self.search_heartbeat_phase = 0
         self.last_best_update_time: Optional[float] = None
         self.panel_snapshot_key: Optional[Tuple[str, str]] = None
@@ -622,9 +628,10 @@ class MancalaWindow(QMainWindow):
         self.slice_hide_token += 1
         self.slice_start_time = time.perf_counter()
         self.search_heartbeat_phase = 0
-        self.slice_progress.setRange(0, SOLVE_SLICE_MS)
+        slice_ms = max(1, self.active_slice_ms)
+        self.slice_progress.setRange(0, slice_ms)
         self.slice_progress.setValue(0)
-        self.slice_progress_label.setText(f"Slice: 0/{SOLVE_SLICE_MS} ms")
+        self.slice_progress_label.setText(f"Slice: 0/{slice_ms} ms")
         self.slice_progress_label.show()
         self.slice_progress.show()
         if not self.slice_progress_timer.isActive():
@@ -634,18 +641,20 @@ class MancalaWindow(QMainWindow):
     def _update_slice_progress_bar(self) -> None:
         if self.slice_start_time is None:
             return
+        slice_ms = max(1, self.active_slice_ms)
         elapsed_ms = int((time.perf_counter() - self.slice_start_time) * 1000)
-        shown_ms = min(SOLVE_SLICE_MS, max(0, elapsed_ms))
+        shown_ms = min(slice_ms, max(0, elapsed_ms))
         self.slice_progress.setValue(shown_ms)
-        self.slice_progress_label.setText(f"Slice: {shown_ms}/{SOLVE_SLICE_MS} ms")
+        self.slice_progress_label.setText(f"Slice: {shown_ms}/{slice_ms} ms")
         self.search_heartbeat_phase = (self.search_heartbeat_phase + 1) % 4
         self.update_status()
 
     def _finish_slice_progress(self, hide_after_ms: Optional[int] = None) -> None:
         self.slice_start_time = None
         self.slice_progress_timer.stop()
-        self.slice_progress.setValue(SOLVE_SLICE_MS)
-        self.slice_progress_label.setText(f"Slice: {SOLVE_SLICE_MS}/{SOLVE_SLICE_MS} ms")
+        slice_ms = max(1, self.active_slice_ms)
+        self.slice_progress.setValue(slice_ms)
+        self.slice_progress_label.setText(f"Slice: {slice_ms}/{slice_ms} ms")
         if hide_after_ms is None:
             return
         token = self.slice_hide_token
@@ -905,7 +914,9 @@ class MancalaWindow(QMainWindow):
         self._poll_cache_save_completion()
         if self.closing or not self.autosave_enabled:
             return
-        if self.solving:
+        if self.solving or self.animating:
+            return
+        if self.state.to_move == YOU and not is_terminal(self.state):
             return
         now = time.perf_counter()
         if (now - self.last_solver_activity) * 1000 < CACHE_AUTOSAVE_IDLE_MS:
@@ -914,7 +925,9 @@ class MancalaWindow(QMainWindow):
             return
         if not self.solver_worker.is_cache_dirty():
             return
-        snapshot_with_counter = self.solver_worker.try_snapshot_cache_with_counter()
+        snapshot_with_counter = self.solver_worker.try_snapshot_cache_with_counter_budget(
+            CACHE_AUTOSAVE_SNAPSHOT_BUDGET_MS
+        )
         if snapshot_with_counter is None:
             return
         snapshot, mutation_counter = snapshot_with_counter
@@ -1088,6 +1101,8 @@ class MancalaWindow(QMainWindow):
         self.slice_progress_label.hide()
         self.slice_progress_timer.stop()
         self.slice_start_time = None
+        self.active_slice_ms = SOLVE_SLICE_MS
+        self.fast_slices_remaining = SOLVE_FAST_SLICES_AFTER_STATE_CHANGE
         self._clear_anim_counts()
         self.refresh_ui()
         self.schedule_solve_if_needed()
@@ -1125,6 +1140,8 @@ class MancalaWindow(QMainWindow):
         self.slice_progress_label.hide()
         self.slice_progress_timer.stop()
         self.slice_start_time = None
+        self.active_slice_ms = SOLVE_SLICE_MS
+        self.fast_slices_remaining = SOLVE_FAST_SLICES_AFTER_STATE_CHANGE
         self._clear_anim_counts()
         self.refresh_ui()
         self.schedule_solve_if_needed()
@@ -1199,6 +1216,8 @@ class MancalaWindow(QMainWindow):
         self.slice_progress_label.hide()
         self.slice_progress_timer.stop()
         self.slice_start_time = None
+        self.active_slice_ms = SOLVE_SLICE_MS
+        self.fast_slices_remaining = SOLVE_FAST_SLICES_AFTER_STATE_CHANGE
 
         if self.animate_check.isChecked():
             self.start_animation()
@@ -1789,6 +1808,11 @@ class MancalaWindow(QMainWindow):
             self.solver_error_text = None
             self.live_nodes = 0
             self.live_elapsed_ms = 0
+        if self.fast_slices_remaining > 0:
+            self.active_slice_ms = SOLVE_SLICE_MS_FAST
+            self.fast_slices_remaining -= 1
+        else:
+            self.active_slice_ms = SOLVE_SLICE_MS
         self.solving = True
         self.active_start_depth = max(1, start_depth)
         self._start_slice_progress()
@@ -1799,6 +1823,7 @@ class MancalaWindow(QMainWindow):
             start_depth,
             guess_score,
             previous_result,
+            self.active_slice_ms,
         )
 
     def _apply_search_result(self, result: SearchResult) -> None:
