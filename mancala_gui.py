@@ -78,6 +78,7 @@ CACHE_CLOSE_SNAPSHOT_BUDGET_MS = 120
 CACHE_SAVE_POLL_MS = 20
 SOLVER_CLOSE_TIMEOUT_MS = 3_000
 SOLVER_FORCE_STOP_TIMEOUT_MS = 500
+SOLVER_CLOSE_POLL_MS = 50
 SETTINGS_ORG = "prattsm"
 SETTINGS_APP = "mancala_solver"
 
@@ -768,15 +769,15 @@ class MancalaWindow(QMainWindow):
     def _wait_for_solver_thread_with_updates(self, timeout_ms: int, phase_text: str) -> bool:
         deadline = time.perf_counter() + (max(0, timeout_ms) / 1000.0)
         while True:
+            if not self.solver_thread.isRunning():
+                return True
             remaining_ms = int((deadline - time.perf_counter()) * 1000)
             if remaining_ms <= 0:
-                return False
-            chunk_ms = min(100, remaining_ms)
-            if self.solver_thread.wait(chunk_ms):
-                return True
+                return not self.solver_thread.isRunning()
             elapsed_s = (timeout_ms - remaining_ms) / 1000.0
             progress = 10 + int(((timeout_ms - remaining_ms) / max(1, timeout_ms)) * 35)
             self._update_shutdown_status(f"{phase_text} ({elapsed_s:.1f}s)", progress=progress)
+            time.sleep(SOLVER_CLOSE_POLL_MS / 1000.0)
 
     def _ensure_cache_save_worker(self) -> bool:
         process = self.cache_save_process
@@ -2281,14 +2282,20 @@ class MancalaWindow(QMainWindow):
             if not stopped:
                 self._update_shutdown_status("Force stopping solver...", progress=50)
                 self.solver_thread.terminate()
-                self._wait_for_solver_thread_with_updates(
+                stopped = self._wait_for_solver_thread_with_updates(
                     SOLVER_FORCE_STOP_TIMEOUT_MS,
                     "Force stopping solver...",
                 )
-            self._finalize_cache_save_before_close(CACHE_CLOSE_SAVE_TIMEOUT_MS)
+            if stopped:
+                self._finalize_cache_save_before_close(CACHE_CLOSE_SAVE_TIMEOUT_MS)
+            else:
+                self._update_shutdown_status("Solver did not stop; skipping final cache save", progress=88)
             self._update_shutdown_status("Finishing...", progress=98)
             self.solver_worker.close()
             self._update_shutdown_status("Closed", progress=100)
+            if self.solver_thread.isRunning():
+                self._pump_ui_events()
+                os._exit(0)
         finally:
             self._hide_shutdown_dialog()
         super().closeEvent(event)

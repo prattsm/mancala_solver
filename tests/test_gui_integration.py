@@ -25,12 +25,19 @@ if HAS_QT:
             self.requested_interruption = False
             self.quit_called = False
             self.terminate_called = False
+            self.running = True
+            self.running_script = []
 
         def requestInterruption(self) -> None:
             self.requested_interruption = True
 
         def isInterruptionRequested(self) -> bool:
             return self.requested_interruption
+
+        def isRunning(self) -> bool:
+            if self.running_script:
+                return self.running_script.pop(0)
+            return self.running
 
         def quit(self) -> None:
             self.quit_called = True
@@ -43,6 +50,7 @@ if HAS_QT:
 
         def terminate(self) -> None:
             self.terminate_called = True
+            self.running = False
 
 
     class _DummyWorker:
@@ -280,14 +288,14 @@ class TestGUIIntegration(unittest.TestCase):
         self.assertEqual(self.window.current_best_move, 4)
 
     def test_close_event_uses_bounded_wait_and_terminate_fallback(self) -> None:
-        self.window.solver_thread.wait_results = [False] * 64
+        self.window.solver_thread.running_script = [True] * 128
         self.window.solver_worker.tt_mutation_counter = 1
         event = QCloseEvent()
 
         self.window.closeEvent(event)
 
-        self.assertTrue(self.window.solver_thread.wait_calls)
-        self.assertTrue(all(timeout <= 100 for timeout in self.window.solver_thread.wait_calls))
+        self.assertTrue(self.window.solver_thread.requested_interruption)
+        self.assertTrue(self.window.solver_thread.quit_called)
         self.assertTrue(self.window.solver_thread.terminate_called)
         self.assertEqual(self.window.solver_worker.tt_saved_counter, 1)
         self.window = None
