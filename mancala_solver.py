@@ -32,7 +32,7 @@ from mancala_telemetry import (
 
 INF = 10**9
 FULL_DEPTH = 1_000_000
-CACHE_VERSION = 6
+CACHE_VERSION = 7
 TT_MAX_ENTRIES = 1_000_000
 TT_PRUNE_TO = 800_000
 ASPIRATION_WINDOW_INIT = 4
@@ -76,6 +76,7 @@ class SearchResult:
     complete: bool
     elapsed_ms: int
     nodes: int
+    tt_stores: int = 0
 
 
 @dataclass(slots=True)
@@ -90,6 +91,7 @@ class _SearchContext:
     history_scores: Dict[Tuple[str, int], int] = field(default_factory=dict)
     iter_depth: int = 0
     nodes: int = 0
+    tt_stores: int = 0
     hit_horizon: bool = False
     used_unproven_exact_tt: bool = False
     interrupted: bool = False
@@ -128,6 +130,7 @@ class _DepthSearchResult:
     fail_low: bool
     fail_high: bool
     root_scores: Tuple[Tuple[int, int], ...] = ()
+    proven: bool = False
     aspiration_window: int = 0
     aspiration_retries: int = 0
 
@@ -201,13 +204,13 @@ def _tt_store(
     state: State,
     entry: TTEntry,
     on_mutation: Optional[Callable[[], None]] = None,
-) -> None:
+) -> bool:
     existing = tt.get(state)
     if existing is not None:
         if existing.depth > entry.depth:
-            return
+            return False
         if existing.depth == entry.depth and existing.flag == EXACT and entry.flag != EXACT:
-            return
+            return False
         if (
             existing.depth == entry.depth
             and existing.flag == EXACT
@@ -215,13 +218,15 @@ def _tt_store(
             and existing.proven
             and not entry.proven
         ):
-            return
+            return False
     tt[state] = entry
     if on_mutation is not None:
         on_mutation()
+    mutated = True
     if _prune_tt(tt):
         if on_mutation is not None:
             on_mutation()
+    return mutated
 
 
 def load_tt(path: Path) -> Dict[State, TTEntry]:
@@ -610,6 +615,7 @@ def _decorate_depth_result(
         fail_low=outcome.fail_low,
         fail_high=outcome.fail_high,
         root_scores=outcome.root_scores,
+        proven=outcome.proven,
         aspiration_window=aspiration_window,
         aspiration_retries=aspiration_retries,
     )
@@ -644,22 +650,24 @@ def _search_depth(
             context.telemetry.tt_hits += 1
         value, flag = denormalize_value_flag(entry.value, entry.flag, sign)
         if flag == EXACT:
-            if context.telemetry is not None:
-                context.telemetry.tt_exact_reuse += 1
-            if not entry.proven:
-                context.used_unproven_exact_tt = True
-            return value, EXACT, entry.proven
+            if entry.proven:
+                if context.telemetry is not None:
+                    context.telemetry.tt_exact_reuse += 1
+                return value, EXACT, True
+            # Unproven exact entries are useful for move ordering only.
+            context.used_unproven_exact_tt = True
         if context.telemetry is not None:
             context.telemetry.tt_bound_reuse += 1
-        if flag == LOWER:
-            alpha = max(alpha, value)
-        elif flag == UPPER:
-            beta = min(beta, value)
-        if alpha >= beta:
-            _telemetry_record_cutoff(context, depth, "tt_bound")
+        if flag != EXACT:
             if flag == LOWER:
-                return alpha, LOWER, False
-            return beta, UPPER, False
+                alpha = max(alpha, value)
+            elif flag == UPPER:
+                beta = min(beta, value)
+            if alpha >= beta:
+                _telemetry_record_cutoff(context, depth, "tt_bound")
+                if flag == LOWER:
+                    return alpha, LOWER, False
+                return beta, UPPER, False
 
     children = ordered_children(state, context.tt, context=context, depth_remaining=depth)
     if context.telemetry is not None:
@@ -715,14 +723,16 @@ def _search_depth(
     value_norm, flag_norm = normalize_value_flag(best, flag, sign)
     best_move_norm = normalize_move(best_move, sign)
     exact_proven = all_children_proven if flag == EXACT else False
-    if context.telemetry is not None:
-        context.telemetry.tt_stores += 1
-    _tt_store(
+    changed = _tt_store(
         context.tt,
         norm_state,
         TTEntry(value_norm, flag_norm, best_move_norm, depth, exact_proven),
         on_mutation=context.tt_mutation_callback,
     )
+    if changed:
+        context.tt_stores += 1
+        if context.telemetry is not None:
+            context.telemetry.tt_stores += 1
     return best, flag, exact_proven
 
 
@@ -759,9 +769,10 @@ def _best_move_depth(
             fail_low=score <= alpha,
             fail_high=score >= beta,
             root_scores=(),
+            proven=True,
         )
 
-    scored: List[Tuple[int, int]] = []
+    scored: List[Tuple[int, int, bool]] = []
     alpha_root = alpha
     beta_root = beta
     if state.to_move == YOU:
@@ -769,12 +780,12 @@ def _best_move_depth(
             _check_deadline(context)
             move_alpha = alpha_root
             move_beta = beta_root
-            val, val_flag, _ = _search_depth(child_state, move_alpha, move_beta, depth - 1, context)
+            val, val_flag, val_proven = _search_depth(child_state, move_alpha, move_beta, depth - 1, context)
             if val_flag != EXACT:
                 # Keep root move scores exact so top-move display/ranking is stable.
                 _check_deadline(context)
-                val, _, _ = _search_depth(child_state, -INF, INF, depth - 1, context)
-            scored.append((move, val))
+                val, _, val_proven = _search_depth(child_state, -INF, INF, depth - 1, context)
+            scored.append((move, val, val_proven))
             alpha_root = max(alpha_root, val)
         scored.sort(key=lambda item: item[1], reverse=True)
     else:
@@ -782,26 +793,28 @@ def _best_move_depth(
             _check_deadline(context)
             move_alpha = alpha_root
             move_beta = beta_root
-            val, val_flag, _ = _search_depth(child_state, move_alpha, move_beta, depth - 1, context)
+            val, val_flag, val_proven = _search_depth(child_state, move_alpha, move_beta, depth - 1, context)
             if val_flag != EXACT:
                 # Keep root move scores exact so top-move display/ranking is stable.
                 _check_deadline(context)
-                val, _, _ = _search_depth(child_state, -INF, INF, depth - 1, context)
-            scored.append((move, val))
+                val, _, val_proven = _search_depth(child_state, -INF, INF, depth - 1, context)
+            scored.append((move, val, val_proven))
             beta_root = min(beta_root, val)
         scored.sort(key=lambda item: item[1])
 
     topn = max(0, topn)
-    top_moves = scored[:topn] if topn > 0 else []
+    top_moves = [(move, value) for move, value, _ in scored[:topn]] if topn > 0 else []
     best_move = scored[0][0]
     best_score = scored[0][1]
+    root_proven = all(val_proven for _, _, val_proven in scored)
     return _DepthSearchResult(
         best_move=best_move,
         score=best_score,
         top_moves=top_moves,
         fail_low=best_score <= alpha,
         fail_high=best_score >= beta,
-        root_scores=tuple(scored),
+        root_scores=tuple((move, value) for move, value, _ in scored),
+        proven=root_proven,
     )
 
 
@@ -1007,6 +1020,7 @@ def solve_best_move(
             complete=True,
             elapsed_ms=elapsed_ms,
             nodes=0,
+            tt_stores=0,
         )
         _emit_search_end(result, "complete")
         return result
@@ -1055,6 +1069,7 @@ def solve_best_move(
                 complete=False,
                 elapsed_ms=elapsed_ms,
                 nodes=context.nodes,
+                tt_stores=context.tt_stores,
             )
             _emit_live(result.nodes)
             if progress_callback is not None:
@@ -1072,9 +1087,10 @@ def solve_best_move(
             score=depth_result.score,
             top_moves=depth_result.top_moves,
             depth=0,
-            complete=(not context.hit_horizon and not context.used_unproven_exact_tt),
+            complete=(depth_result.proven and not context.hit_horizon),
             elapsed_ms=elapsed_ms,
             nodes=context.nodes,
+            tt_stores=context.tt_stores,
         )
         _emit_live(result.nodes)
         if progress_callback is not None:
@@ -1091,6 +1107,7 @@ def solve_best_move(
     deadline_ns = time.perf_counter_ns() + (max(0, time_limit_ms) * 1_000_000)
     hard_deadline_ns = deadline_ns + SLICE_DEADLINE_SLACK_NS
     total_nodes = 0
+    total_tt_stores = 0
     best_result: Optional[SearchResult] = None
     best_result_hit_horizon = False
     best_result_used_unproven_exact_tt = False
@@ -1131,6 +1148,7 @@ def solve_best_move(
             break
 
         total_nodes += context.nodes
+        total_tt_stores += context.tt_stores
         elapsed_ms = int((time.perf_counter() - start) * 1000)
         _emit_live(total_nodes)
         result = SearchResult(
@@ -1138,9 +1156,10 @@ def solve_best_move(
             score=depth_result.score,
             top_moves=depth_result.top_moves,
             depth=depth,
-            complete=(not context.hit_horizon and not context.used_unproven_exact_tt),
+            complete=(depth_result.proven and not context.hit_horizon),
             elapsed_ms=elapsed_ms,
             nodes=total_nodes,
+            tt_stores=total_tt_stores,
         )
         best_result = result
         best_result_hit_horizon = context.hit_horizon
@@ -1175,6 +1194,7 @@ def solve_best_move(
         score_guess = previous_result.score if previous_result is not None else guess_score
         depth_guess = previous_result.depth if previous_result is not None else (start_depth - 1)
         nodes_guess = previous_result.nodes if previous_result is not None else 0
+        tt_stores_guess = previous_result.tt_stores if previous_result is not None else 0
         top_guess = list(previous_result.top_moves) if previous_result is not None else []
 
         if move_guess not in legal:
@@ -1202,6 +1222,7 @@ def solve_best_move(
             complete=False,
             elapsed_ms=elapsed_ms,
             nodes=max(0, nodes_guess),
+            tt_stores=max(0, tt_stores_guess),
         )
         _emit_search_end(result, "timeout")
         return result
@@ -1221,6 +1242,7 @@ def solve_best_move(
         complete=False,
         elapsed_ms=elapsed_ms,
         nodes=0,
+        tt_stores=0,
     )
     _emit_search_end(result, "timeout")
     return result

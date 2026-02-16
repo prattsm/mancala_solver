@@ -463,7 +463,7 @@ class TestEngine(unittest.TestCase):
         self.assertFalse(result.complete)
         self.assertEqual(result.top_moves[:1], [(4, 3)])
 
-    def test_unproven_tt_exact_does_not_mark_complete(self):
+    def test_unproven_tt_flag_alone_does_not_block_complete(self):
         state = initial_state(seeds=2, you_first=True)
         original = solver_mod._run_depth_iteration_with_aspiration
         calls = {"count": 0}
@@ -478,6 +478,7 @@ class TestEngine(unittest.TestCase):
                     top_moves=[(3, 2)],
                     fail_low=False,
                     fail_high=False,
+                    proven=True,
                 )
             raise solver_mod.SearchTimeout()
 
@@ -487,9 +488,35 @@ class TestEngine(unittest.TestCase):
         finally:
             solver_mod._run_depth_iteration_with_aspiration = original
 
-        self.assertFalse(result.complete)
+        self.assertTrue(result.complete)
         self.assertEqual(result.depth, 2)
         self.assertEqual(result.best_move, 3)
+
+    def test_unproven_tt_exact_is_not_short_circuit_reused(self):
+        state = initial_state(seeds=2, you_first=True)
+        norm_state, _ = solver_mod.normalize_state(state)
+        tt = {norm_state: TTEntry(987654, EXACT, 1, depth=8, proven=False)}
+        context = solver_mod._SearchContext(tt=tt, deadline_ns=None)
+        original_children = solver_mod.ordered_children
+        calls = {"count": 0}
+
+        def fake_children(_state, _tt, context=None, depth_remaining=None):
+            calls["count"] += 1
+            return []
+
+        try:
+            solver_mod.ordered_children = fake_children
+            value, flag, proven = solver_mod._search_depth(
+                state, -solver_mod.INF, solver_mod.INF, depth=3, context=context
+            )
+        finally:
+            solver_mod.ordered_children = original_children
+
+        self.assertGreater(calls["count"], 0)
+        self.assertEqual(flag, EXACT)
+        self.assertTrue(proven)
+        self.assertNotEqual(value, 987654)
+        self.assertTrue(context.used_unproven_exact_tt)
 
     def test_depth_limited_exact_entry_is_not_marked_proven(self):
         state = make_state(YOU, [2, 2, 0, 0, 0, 0], [1, 2, 0, 0, 2, 0], 11, 16)

@@ -616,6 +616,11 @@ class MancalaWindow(QMainWindow):
         self.solver_error_text: Optional[str] = None
         self.live_nodes = 0
         self.live_elapsed_ms = 0
+        self.slice_nodes = 0
+        self.slice_elapsed_ms = 0
+        self.slice_tt_stores = 0
+        self.pv_stability_count = 0
+        self.low_work_streak = 0
         self.last_solver_activity = time.perf_counter()
         self.last_cache_save_time = 0.0
         self.autosave_enabled = True
@@ -867,6 +872,9 @@ class MancalaWindow(QMainWindow):
         self.slice_hide_token += 1
         self.slice_start_time = time.perf_counter()
         self.search_heartbeat_phase = 0
+        self.slice_nodes = 0
+        self.slice_elapsed_ms = 0
+        self.slice_tt_stores = 0
         slice_ms = max(1, self.active_slice_ms)
         self.slice_progress.setRange(0, slice_ms)
         self.slice_progress.setValue(0)
@@ -919,6 +927,15 @@ class MancalaWindow(QMainWindow):
         if value >= 1_000:
             return f"{value / 1_000:.1f}k"
         return str(value)
+
+    def _reset_search_runtime_metrics(self) -> None:
+        self.live_nodes = 0
+        self.live_elapsed_ms = 0
+        self.slice_nodes = 0
+        self.slice_elapsed_ms = 0
+        self.slice_tt_stores = 0
+        self.pv_stability_count = 0
+        self.low_work_streak = 0
 
     def _queue_requeue_solve(self) -> None:
         if self.closing or self.requeue_pending:
@@ -1317,8 +1334,7 @@ class MancalaWindow(QMainWindow):
         self.last_best_update_time = None
         self.panel_snapshot_key = None
         self.solver_error_text = None
-        self.live_nodes = 0
-        self.live_elapsed_ms = 0
+        self._reset_search_runtime_metrics()
         self.solve_request_id += 1
         self._set_latest_request_id()
         self.solving = False
@@ -1356,8 +1372,7 @@ class MancalaWindow(QMainWindow):
         self.last_best_update_time = None
         self.panel_snapshot_key = None
         self.solver_error_text = None
-        self.live_nodes = 0
-        self.live_elapsed_ms = 0
+        self._reset_search_runtime_metrics()
         self.solve_request_id += 1
         self._set_latest_request_id()
         self.solving = False
@@ -1432,8 +1447,7 @@ class MancalaWindow(QMainWindow):
         self.last_best_update_time = None
         self.panel_snapshot_key = None
         self.solver_error_text = None
-        self.live_nodes = 0
-        self.live_elapsed_ms = 0
+        self._reset_search_runtime_metrics()
         self.solving = False
         self.solve_request_id += 1
         self._set_latest_request_id()
@@ -2032,8 +2046,7 @@ class MancalaWindow(QMainWindow):
             self.last_best_update_time = None
             self.panel_snapshot_key = None
             self.solver_error_text = None
-            self.live_nodes = 0
-            self.live_elapsed_ms = 0
+            self._reset_search_runtime_metrics()
         if self.fast_slices_remaining > 0:
             self.active_slice_ms = SOLVE_SLICE_MS_FAST
             self.fast_slices_remaining -= 1
@@ -2060,15 +2073,37 @@ class MancalaWindow(QMainWindow):
         self.current_top_moves = list(result.top_moves)
         self.live_nodes = result.nodes
         self.live_elapsed_ms = result.elapsed_ms
+        self.slice_nodes = max(self.slice_nodes, result.nodes)
+        self.slice_elapsed_ms = max(self.slice_elapsed_ms, result.elapsed_ms)
+        self.slice_tt_stores = max(self.slice_tt_stores, getattr(result, "tt_stores", 0))
         self.solver_error_text = None
-        if result.best_move is not None:
-            if (
-                prev is None
-                or result.depth != prev.depth
-                or result.best_move != prev.best_move
-                or result.score != prev.score
-            ):
-                self.last_best_update_time = time.perf_counter()
+        pv_changed = True
+        if result.best_move is not None and prev is not None:
+            pv_changed = not (
+                result.best_move == prev.best_move
+                and result.score == prev.score
+            )
+        if result.best_move is None:
+            self.pv_stability_count = 0
+        elif pv_changed:
+            self.pv_stability_count = 1
+            self.last_best_update_time = time.perf_counter()
+        else:
+            self.pv_stability_count += 1
+
+        if prev is None:
+            self.low_work_streak = 0
+        elif result.depth > prev.depth:
+            node_delta = result.nodes - prev.nodes if result.nodes >= prev.nodes else result.nodes
+            tt_store_prev = getattr(prev, "tt_stores", 0)
+            tt_store_now = getattr(result, "tt_stores", 0)
+            tt_store_delta = tt_store_now - tt_store_prev if tt_store_now >= tt_store_prev else tt_store_now
+            if node_delta < 256 and tt_store_delta < 2:
+                self.low_work_streak += 1
+            else:
+                self.low_work_streak = 0
+        elif pv_changed:
+            self.low_work_streak = 0
         self.panel_snapshot_key = None
 
     @Slot(int, object)
@@ -2104,6 +2139,8 @@ class MancalaWindow(QMainWindow):
         self.last_solver_activity = time.perf_counter()
         self.live_nodes = max(self.live_nodes, nodes)
         self.live_elapsed_ms = max(self.live_elapsed_ms, elapsed_ms)
+        self.slice_nodes = max(self.slice_nodes, nodes)
+        self.slice_elapsed_ms = max(self.slice_elapsed_ms, elapsed_ms)
         self.update_status()
 
     @Slot(int, object)
@@ -2156,8 +2193,7 @@ class MancalaWindow(QMainWindow):
         self.current_top_moves = []
         self.last_best_update_time = None
         self.panel_snapshot_key = None
-        self.live_nodes = 0
-        self.live_elapsed_ms = 0
+        self._reset_search_runtime_metrics()
         self.solver_error_text = error_text
         self.update_recommendations()
         self.update_status()
@@ -2376,6 +2412,8 @@ class MancalaWindow(QMainWindow):
                 state_text = f"State: Best so far | Turn: {turn_text}"
             else:
                 state_text = f"State: Idle | Turn: {turn_text}"
+            if self.solving and self.low_work_streak >= 4:
+                state_text += " | cache-heavy probing"
 
         if self.solving and self.state.to_move == YOU and not solved:
             if self.search_progress is None:
@@ -2386,6 +2424,8 @@ class MancalaWindow(QMainWindow):
         depth_text = f"Depth: {completed_depth} complete"
         if probe_depth is not None:
             depth_text += f", probing {probe_depth}"
+        if self.pv_stability_count > 0:
+            depth_text += f" | PV stable x{self.pv_stability_count}"
 
         best_line = f"Best: {best_text}"
         panel_key = (best_line, depth_text)
@@ -2423,7 +2463,8 @@ class MancalaWindow(QMainWindow):
         self.solve_heartbeat_label.setText(heartbeat_text)
 
         self.solve_metrics_label.setText(
-            f"Nodes {self._format_nodes(nodes)} | NPS {self._format_nodes(nps)}/s | Elapsed {elapsed_s:.1f}s"
+            f"Nodes {self._format_nodes(nodes)} | NPS {self._format_nodes(nps)}/s | "
+            f"Elapsed {elapsed_s:.1f}s | Slice +{self._format_nodes(self.slice_nodes)} nodes, +{self.slice_tt_stores} TT"
         )
 
     def _format_drop_location(self, drop: DropLocation) -> str:
