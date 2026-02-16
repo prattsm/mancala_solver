@@ -455,6 +455,25 @@ class TestEngine(unittest.TestCase):
         self.assertFalse(proven)
         self.assertTrue(context.used_unproven_tt)
 
+    def test_unproven_bound_tt_does_not_mark_depth_limit(self):
+        state = make_state(YOU, [1, 0, 0, 0, 0, 0], [1, 0, 0, 0, 0, 0], 0, 0)
+        norm_state, _ = solver_mod.normalize_state(state)
+        tt = {
+            norm_state: TTEntry(1, solver_mod.LOWER, 1, depth=4, proven=False),
+        }
+        context = solver_mod._SearchContext(tt=tt, deadline=None)
+        solver_mod._search_depth(state, alpha=0, beta=1, depth=1, context=context)
+        self.assertFalse(context.hit_depth_limit)
+        self.assertFalse(context.used_unproven_tt)
+
+    def test_quick_fallback_score_matches_selected_move_child(self):
+        state = make_state(YOU, [1, 0, 0, 0, 0, 0], [0, 0, 0, 0, 0, 0], 0, 0)
+        move, score, top = solver_mod._quick_fallback_best_move(state, topn=1)
+        self.assertEqual(move, 1)
+        child_state, _, _ = apply_move_fast_with_info(state, move)
+        self.assertEqual(score, solver_mod._heuristic_eval(child_state))
+        self.assertEqual(top, [(move, score)])
+
     def test_full_solve_interrupt_returns_partial_result(self):
         state = initial_state(seeds=4, you_first=True)
         result = solve_best_move(

@@ -576,13 +576,12 @@ def _search_depth(
         if context.telemetry is not None:
             context.telemetry.tt_hits += 1
         value, flag = denormalize_value_flag(entry.value, entry.flag, sign)
-        if not entry.proven:
-            context.used_unproven_tt = True
         if flag == EXACT:
             if context.telemetry is not None:
                 context.telemetry.tt_exact_reuse += 1
             if not entry.proven:
                 context.hit_depth_limit = True
+                context.used_unproven_tt = True
             return value, entry.proven
         if context.telemetry is not None:
             context.telemetry.tt_bound_reuse += 1
@@ -796,7 +795,11 @@ def _quick_fallback_best_move(
     if not moves:
         return None, terminal_diff(state), []
     move = move_hint if move_hint in moves else moves[0]
-    score = _heuristic_eval(state) if score_hint is None else score_hint
+    if score_hint is None:
+        child_state, _, _ = apply_move_fast_with_info(state, move)
+        score = _heuristic_eval(child_state)
+    else:
+        score = score_hint
     topn = max(0, topn)
     top_moves = [(move, score)] if topn > 0 else []
     return move, score, top_moves
@@ -977,7 +980,7 @@ def solve_best_move(
             score=depth_result.score,
             top_moves=depth_result.top_moves,
             depth=0,
-            complete=(not context.hit_depth_limit and not context.used_unproven_tt),
+            complete=(not context.hit_depth_limit),
             elapsed_ms=elapsed_ms,
             nodes=context.nodes,
         )
@@ -1032,7 +1035,7 @@ def solve_best_move(
             score=depth_result.score,
             top_moves=depth_result.top_moves,
             depth=depth,
-            complete=(not context.hit_depth_limit and not context.used_unproven_tt),
+            complete=(not context.hit_depth_limit),
             elapsed_ms=elapsed_ms,
             nodes=total_nodes,
         )
