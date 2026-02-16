@@ -43,6 +43,8 @@ class IterationDoneEvent:
     score: int
     best_move: Optional[int]
     complete: bool
+    hit_horizon: bool
+    used_unproven_exact_tt: bool
     nodes: int
     elapsed_ms: int
     max_depth: int
@@ -87,6 +89,8 @@ class SearchEndEvent:
     score: int
     depth: int
     complete: bool
+    hit_horizon: bool
+    used_unproven_exact_tt: bool
     nodes: int
     elapsed_ms: int
     reason: str

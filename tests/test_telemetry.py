@@ -67,6 +67,8 @@ class TestTelemetry(unittest.TestCase):
         search_end_events = [event for event in sink.events if event.event == "search_end"]
         self.assertTrue(search_end_events)
         self.assertEqual(search_end_events[-1].data.get("reason"), "timeout")
+        self.assertIn("hit_horizon", search_end_events[-1].data)
+        self.assertIn("used_unproven_exact_tt", search_end_events[-1].data)
 
     def test_search_end_reason_depth_limit_for_full_solve_heuristic(self):
         sink = _CollectSink()
@@ -95,6 +97,24 @@ class TestTelemetry(unittest.TestCase):
         search_end_events = [event for event in sink.events if event.event == "search_end"]
         self.assertTrue(search_end_events)
         self.assertEqual(search_end_events[-1].data.get("reason"), "depth_limit")
+        self.assertTrue(search_end_events[-1].data.get("hit_horizon"))
+        self.assertFalse(search_end_events[-1].data.get("used_unproven_exact_tt"))
+
+    def test_iteration_done_includes_completeness_diagnostics(self):
+        sink = _CollectSink()
+        state = initial_state(seeds=2, you_first=True)
+        solver_mod.solve_best_move(
+            state,
+            topn=3,
+            tt={},
+            time_limit_ms=60,
+            telemetry_sink=sink,
+        )
+        iteration_events = [event for event in sink.events if event.event == "iteration_done"]
+        self.assertTrue(iteration_events)
+        latest = iteration_events[-1].data
+        self.assertIn("hit_horizon", latest)
+        self.assertIn("used_unproven_exact_tt", latest)
 
 
 if __name__ == "__main__":

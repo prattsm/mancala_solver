@@ -164,11 +164,22 @@ def _tt_get(tt: Dict[State, TTEntry], state: State) -> Optional[TTEntry]:
 def _prune_tt(tt: Dict[State, TTEntry]) -> bool:
     if len(tt) <= TT_MAX_ENTRIES:
         return False
-    pruned = False
-    while len(tt) > TT_PRUNE_TO:
-        tt.pop(next(iter(tt)))
-        pruned = True
-    return pruned
+    remove_count = len(tt) - TT_PRUNE_TO
+    if remove_count <= 0:
+        return False
+
+    # Prefer keeping deeper/exact/proven entries when pruning.
+    candidates = list(tt.items())
+    candidates.sort(
+        key=lambda item: (
+            item[1].depth,
+            1 if item[1].flag == EXACT else 0,
+            1 if item[1].proven else 0,
+        )
+    )
+    for state, _ in candidates[:remove_count]:
+        tt.pop(state, None)
+    return True
 
 
 def _tt_store(
@@ -842,7 +853,12 @@ def solve_best_move(
             ),
         )
 
-    def _emit_search_end(result: SearchResult, reason: str) -> None:
+    def _emit_search_end(
+        result: SearchResult,
+        reason: str,
+        hit_horizon: bool = False,
+        used_unproven_exact_tt: bool = False,
+    ) -> None:
         if telemetry is None:
             return
         # Force one final batch so dashboards don't stall between iterations.
@@ -858,6 +874,8 @@ def solve_best_move(
                 score=result.score,
                 depth=result.depth,
                 complete=result.complete,
+                hit_horizon=hit_horizon,
+                used_unproven_exact_tt=used_unproven_exact_tt,
                 nodes=result.nodes,
                 elapsed_ms=result.elapsed_ms,
                 reason=reason,
@@ -884,7 +902,9 @@ def solve_best_move(
             ),
         )
 
-    def _emit_iteration_done(depth: int, depth_result: _DepthSearchResult, result: SearchResult) -> None:
+    def _emit_iteration_done(
+        depth: int, depth_result: _DepthSearchResult, result: SearchResult, context: _SearchContext
+    ) -> None:
         if telemetry is None:
             return
         pv_scored = _extract_pv_scored(state, tt)
@@ -896,6 +916,8 @@ def solve_best_move(
                 score=depth_result.score,
                 best_move=depth_result.best_move,
                 complete=result.complete,
+                hit_horizon=context.hit_horizon,
+                used_unproven_exact_tt=context.used_unproven_exact_tt,
                 nodes=result.nodes,
                 elapsed_ms=result.elapsed_ms,
                 max_depth=telemetry.max_depth,
@@ -973,7 +995,12 @@ def solve_best_move(
             _emit_live(result.nodes)
             if progress_callback is not None:
                 progress_callback(result)
-            _emit_search_end(result, "interrupted")
+            _emit_search_end(
+                result,
+                "interrupted",
+                hit_horizon=context.hit_horizon,
+                used_unproven_exact_tt=context.used_unproven_exact_tt,
+            )
             return result
         elapsed_ms = int((time.perf_counter() - start) * 1000)
         result = SearchResult(
@@ -988,14 +1015,21 @@ def solve_best_move(
         _emit_live(result.nodes)
         if progress_callback is not None:
             progress_callback(result)
-        _emit_iteration_done(depth=0, depth_result=depth_result, result=result)
-        _emit_search_end(result, "complete" if result.complete else "depth_limit")
+        _emit_iteration_done(depth=0, depth_result=depth_result, result=result, context=context)
+        _emit_search_end(
+            result,
+            "complete" if result.complete else "depth_limit",
+            hit_horizon=context.hit_horizon,
+            used_unproven_exact_tt=context.used_unproven_exact_tt,
+        )
         return result
 
     deadline = start + max(0, time_limit_ms) / 1000.0
     hard_deadline = deadline + (SLICE_DEADLINE_SLACK_MS / 1000.0)
     total_nodes = 0
     best_result: Optional[SearchResult] = None
+    best_result_hit_horizon = False
+    best_result_used_unproven_exact_tt = False
     depth = max(1, start_depth)
     current_guess = guess_score
     timed_out_due_interrupt = False
@@ -1041,17 +1075,29 @@ def solve_best_move(
             nodes=total_nodes,
         )
         best_result = result
-        _emit_iteration_done(depth=depth, depth_result=depth_result, result=result)
+        best_result_hit_horizon = context.hit_horizon
+        best_result_used_unproven_exact_tt = context.used_unproven_exact_tt
+        _emit_iteration_done(depth=depth, depth_result=depth_result, result=result, context=context)
         if progress_callback is not None:
             progress_callback(result)
         if result.complete:
-            _emit_search_end(result, "complete")
+            _emit_search_end(
+                result,
+                "complete",
+                hit_horizon=context.hit_horizon,
+                used_unproven_exact_tt=context.used_unproven_exact_tt,
+            )
             return result
         current_guess = result.score
         depth += 1
 
     if best_result is not None:
-        _emit_search_end(best_result, "interrupted" if timed_out_due_interrupt else "timeout")
+        _emit_search_end(
+            best_result,
+            "interrupted" if timed_out_due_interrupt else "timeout",
+            hit_horizon=best_result_hit_horizon,
+            used_unproven_exact_tt=best_result_used_unproven_exact_tt,
+        )
         return best_result
 
     # Deadline was hit before completing the first requested depth.
