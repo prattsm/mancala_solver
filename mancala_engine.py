@@ -382,14 +382,6 @@ def _apply_move(state: State, pit_num: int) -> tuple[State, bool, bool, MoveTrac
 
 
 def pretty_print(state: State) -> str:
-    """
-    Pretty, GamePigeon-like vertical Kalah board.
-
-    Conventions (locked to your earlier decisions):
-      - Opponent pits: 1..6 left->right, with pit 1 closest to OS (left store).
-      - Your pits: pit 1 closest to YS (right store), so displayed left->right as 6..1.
-      - Stores shown as left (OS) and right (YS) columns.
-    """
     max_val = max(state.store_you, state.store_opp, *state.pits_you, *state.pits_opp)
     digits = max(2, len(str(max_val)))  # keep 2-digit look, expand if needed
 
