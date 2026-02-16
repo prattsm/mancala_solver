@@ -6,6 +6,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Callable, Dict, List, Optional, Tuple
 import gzip
+import heapq
 import os
 import pickle
 import time
@@ -61,7 +62,7 @@ class TTEntry:
     proven: bool = False
 
 
-@dataclass(frozen=True)
+@dataclass(frozen=True, slots=True)
 class SearchResult:
     best_move: Optional[int]
     score: int
@@ -87,7 +88,7 @@ class _SearchContext:
     interrupted: bool = False
 
 
-@dataclass
+@dataclass(slots=True)
 class _TelemetryStats:
     sink: TelemetrySink
     solve_start: float
@@ -112,7 +113,7 @@ class _TelemetryStats:
     cutoff_hist: Dict[int, int] = field(default_factory=dict)
 
 
-@dataclass(frozen=True)
+@dataclass(frozen=True, slots=True)
 class _DepthSearchResult:
     best_move: Optional[int]
     score: int
@@ -162,22 +163,24 @@ def _tt_get(tt: Dict[State, TTEntry], state: State) -> Optional[TTEntry]:
 
 
 def _prune_tt(tt: Dict[State, TTEntry]) -> bool:
-    if len(tt) <= TT_MAX_ENTRIES:
+    size = len(tt)
+    if size <= TT_MAX_ENTRIES:
         return False
-    remove_count = len(tt) - TT_PRUNE_TO
+    remove_count = size - TT_PRUNE_TO
     if remove_count <= 0:
         return False
 
     # Prefer keeping deeper/exact/proven entries when pruning.
-    candidates = list(tt.items())
-    candidates.sort(
+    worst = heapq.nsmallest(
+        remove_count,
+        tt.items(),
         key=lambda item: (
             item[1].depth,
             1 if item[1].flag == EXACT else 0,
             1 if item[1].proven else 0,
-        )
+        ),
     )
-    for state, _ in candidates[:remove_count]:
+    for state, _ in worst:
         tt.pop(state, None)
     return True
 

@@ -3,7 +3,7 @@
 CLI and desktop GUI that recommend the best move for GamePigeon Mancala in Capture mode (Kalah rules). It assumes optimal play from both sides and uses minimax + alpha-beta with iterative deepening.
 
 ## Setup
-- Python 3.10+ recommended
+- Python 3.12+ recommended
 - CLI: no external dependencies
 - GUI (recommended in a virtualenv; avoids PEP 668/system package conflicts):
 

@@ -313,6 +313,34 @@ class TestEngine(unittest.TestCase):
             solver_mod.TT_MAX_ENTRIES = original_max
             solver_mod.TT_PRUNE_TO = original_prune_to
 
+    def test_tt_prune_prefers_deeper_and_exact_entries(self):
+        original_max = solver_mod.TT_MAX_ENTRIES
+        original_prune_to = solver_mod.TT_PRUNE_TO
+        try:
+            solver_mod.TT_MAX_ENTRIES = 4
+            solver_mod.TT_PRUNE_TO = 2
+            tt = {}
+            states = [
+                make_state(YOU, [1, 1, 1, 1, 1, 1], [1, 1, 1, 1, 1, 1], store_you=i, store_opp=0)
+                for i in range(5)
+            ]
+            entries = [
+                TTEntry(0, solver_mod.LOWER, 1, 1, False),
+                TTEntry(0, EXACT, 1, 1, False),
+                TTEntry(0, solver_mod.LOWER, 1, 2, False),
+                TTEntry(0, EXACT, 1, 2, True),
+                TTEntry(0, solver_mod.LOWER, 1, 3, False),
+            ]
+            for state, entry in zip(states, entries):
+                solver_mod._tt_store(tt, state, entry)
+
+            self.assertEqual(len(tt), 2)
+            self.assertIn(states[3], tt)
+            self.assertIn(states[4], tt)
+        finally:
+            solver_mod.TT_MAX_ENTRIES = original_max
+            solver_mod.TT_PRUNE_TO = original_prune_to
+
     def test_tt_store_mutation_callback_only_when_tt_changes(self):
         state = make_state(YOU, [1, 1, 1, 1, 1, 1], [1, 1, 1, 1, 1, 1], 0, 0)
         tt = {}
