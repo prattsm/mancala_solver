@@ -176,9 +176,10 @@ class TestEngine(unittest.TestCase):
                 pits = state.pits_you if state.to_move == YOU else state.pits_opp
                 if pits[move - 1] == 0:
                     continue
-                fast_state, _, _ = apply_move_fast_with_info(state, move)
-                trace_state = apply_move_with_info(state, move).state
-                self.assertEqual(fast_state, trace_state)
+                with self.subTest(to_move=state.to_move, move=move, state=state):
+                    fast_state, _, _ = apply_move_fast_with_info(state, move)
+                    trace_state = apply_move_with_info(state, move).state
+                    self.assertEqual(fast_state, trace_state)
 
     def test_fast_vs_trace_random_reachable_states(self):
         rng = random.Random(11)
@@ -218,14 +219,15 @@ class TestEngine(unittest.TestCase):
 
         for _ in range(10):
             state = random_reachable_opp_state()
-            search(state, -INF, INF, tt)
-            best = _tt_best_move(state, tt)
-            legal = legal_moves(state)
-            if best is not None:
-                self.assertIn(best, legal)
-                apply_move_fast_with_info(state, best)
-            children = ordered_children(state, tt)
-            self.assertTrue(children)
+            with self.subTest(state=state):
+                search(state, -INF, INF, tt)
+                best = _tt_best_move(state, tt)
+                legal = legal_moves(state)
+                if best is not None:
+                    self.assertIn(best, legal)
+                    apply_move_fast_with_info(state, best)
+                children = ordered_children(state, tt)
+                self.assertTrue(children)
 
     def test_best_move_value_matches_search(self):
         rng = random.Random(21)
@@ -378,10 +380,12 @@ class TestEngine(unittest.TestCase):
         value = search_depth(state, depth=2, tt=tt)
         self.assertNotEqual(value, 123456)
 
-    def test_solve_best_move_scores_all_root_moves(self):
-        state = initial_state(seeds=4, you_first=True)
-        result = solve_best_move(state, topn=6, tt={}, time_limit_ms=50)
+    def test_best_move_depth_scores_all_root_moves(self):
+        state = initial_state(seeds=2, you_first=True)
+        context = solver_mod._SearchContext(tt={}, deadline_ns=None, iter_depth=4)
+        result = solver_mod._best_move_depth(state, topn=6, depth=4, context=context)
         self.assertEqual(len(result.top_moves), len(legal_moves(state)))
+        self.assertEqual(len(result.root_scores), len(legal_moves(state)))
 
     def test_solve_best_move_uses_start_depth_and_guess_on_timeout(self):
         state = initial_state(seeds=2, you_first=True)
@@ -449,7 +453,7 @@ class TestEngine(unittest.TestCase):
 
         try:
             solver_mod._run_depth_iteration_with_aspiration = fake_iteration
-            result = solve_best_move(state, topn=3, tt={}, time_limit_ms=100)
+            result = solver_mod.solve_best_move(state, topn=3, tt={}, time_limit_ms=100)
         finally:
             solver_mod._run_depth_iteration_with_aspiration = original
 
@@ -460,13 +464,32 @@ class TestEngine(unittest.TestCase):
         self.assertEqual(result.top_moves[:1], [(4, 3)])
 
     def test_unproven_tt_exact_does_not_mark_complete(self):
-        state = initial_state(seeds=4, you_first=True)
-        tt = {}
-        for move in legal_moves(state):
-            child_state, _, _ = apply_move_fast_with_info(state, move)
-            solver_mod.search_depth(child_state, depth=1, tt=tt)
-        result = solve_best_move(state, topn=3, tt=tt, time_limit_ms=200, start_depth=2)
+        state = initial_state(seeds=2, you_first=True)
+        original = solver_mod._run_depth_iteration_with_aspiration
+        calls = {"count": 0}
+
+        def fake_iteration(state, topn, depth, guess_score, context):
+            calls["count"] += 1
+            if calls["count"] == 1:
+                context.used_unproven_exact_tt = True
+                return solver_mod._DepthSearchResult(
+                    best_move=3,
+                    score=2,
+                    top_moves=[(3, 2)],
+                    fail_low=False,
+                    fail_high=False,
+                )
+            raise solver_mod.SearchTimeout()
+
+        try:
+            solver_mod._run_depth_iteration_with_aspiration = fake_iteration
+            result = solver_mod.solve_best_move(state, topn=3, tt={}, time_limit_ms=100, start_depth=2)
+        finally:
+            solver_mod._run_depth_iteration_with_aspiration = original
+
         self.assertFalse(result.complete)
+        self.assertEqual(result.depth, 2)
+        self.assertEqual(result.best_move, 3)
 
     def test_depth_limited_exact_entry_is_not_marked_proven(self):
         state = make_state(YOU, [2, 2, 0, 0, 0, 0], [1, 2, 0, 0, 2, 0], 11, 16)
@@ -551,11 +574,87 @@ class TestEngine(unittest.TestCase):
 
             try:
                 solver_mod.pickle.load = boom
-                loaded = load_tt(path)
+                loaded = solver_mod.load_tt(path)
             finally:
                 solver_mod.pickle.load = original_pickle_load
 
         self.assertEqual(loaded, {})
+
+    def test_aspiration_window_retries_and_doubles(self):
+        state = initial_state(seeds=2, you_first=True)
+        context = solver_mod._SearchContext(tt={}, deadline_ns=None, iter_depth=5)
+        original = solver_mod._best_move_depth
+        calls = []
+
+        def fake_best_move_depth(state, topn, depth, context, alpha=-INF, beta=INF):
+            calls.append((alpha, beta))
+            if len(calls) == 1:
+                return solver_mod._DepthSearchResult(
+                    best_move=1,
+                    score=beta,
+                    top_moves=[(1, beta)],
+                    fail_low=False,
+                    fail_high=True,
+                )
+            if len(calls) == 2:
+                return solver_mod._DepthSearchResult(
+                    best_move=2,
+                    score=alpha,
+                    top_moves=[(2, alpha)],
+                    fail_low=True,
+                    fail_high=False,
+                )
+            return solver_mod._DepthSearchResult(
+                best_move=3,
+                score=11,
+                top_moves=[(3, 11)],
+                fail_low=False,
+                fail_high=False,
+            )
+
+        try:
+            solver_mod._best_move_depth = fake_best_move_depth
+            result = solver_mod._run_depth_iteration_with_aspiration(
+                state=state,
+                topn=3,
+                depth=5,
+                guess_score=10,
+                context=context,
+            )
+        finally:
+            solver_mod._best_move_depth = original
+
+        self.assertEqual(calls, [(6, 14), (2, 18), (-6, 26)])
+        self.assertEqual(result.best_move, 3)
+        self.assertEqual(result.score, 11)
+        self.assertEqual(result.aspiration_window, 16)
+        self.assertEqual(result.aspiration_retries, 2)
+
+    def test_normalization_round_trip_helpers(self):
+        states = [
+            make_state(YOU, [4, 4, 4, 4, 4, 4], [4, 4, 4, 4, 4, 4], 0, 0),
+            make_state(OPP, [0, 1, 3, 0, 2, 0], [4, 0, 1, 0, 0, 2], 6, 5),
+        ]
+        values = [-17, 0, 23]
+        flags = [EXACT, solver_mod.LOWER, solver_mod.UPPER]
+        moves = [None, 1, 3, 6]
+
+        for state in states:
+            with self.subTest(state=state):
+                normalized, sign = solver_mod.normalize_state(state)
+                normalized_2, sign_2 = solver_mod.normalize_state(normalized)
+                self.assertEqual(sign_2, 1)
+                self.assertEqual(normalized_2, normalized)
+                for value in values:
+                    for flag in flags:
+                        norm_value, norm_flag = solver_mod.normalize_value_flag(value, flag, sign)
+                        denorm_value, denorm_flag = solver_mod.denormalize_value_flag(norm_value, norm_flag, sign)
+                        self.assertEqual(denorm_value, value)
+                        self.assertEqual(denorm_flag, flag)
+                for move in moves:
+                    norm_move = solver_mod.normalize_move(move, sign)
+                    denorm_move = solver_mod.denormalize_move(norm_move, sign)
+                    self.assertEqual(denorm_move, move)
 
     def test_root_aspiration_researches_bound_scores(self):
         state = initial_state(seeds=1, you_first=True)
