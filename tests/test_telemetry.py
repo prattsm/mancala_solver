@@ -73,7 +73,7 @@ class TestTelemetry(unittest.TestCase):
         state = initial_state(seeds=2, you_first=True)
 
         def fake_best_move_depth(_state, _topn, _depth, context, _alpha, _beta):
-            context.hit_depth_limit = True
+            context.hit_horizon = True
             return solver_mod._DepthSearchResult(
                 best_move=1,
                 score=0,

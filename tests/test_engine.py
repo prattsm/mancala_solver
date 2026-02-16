@@ -409,7 +409,7 @@ class TestEngine(unittest.TestCase):
             calls["count"] += 1
             if calls["count"] == 1:
                 context.nodes += 17
-                context.hit_depth_limit = True
+                context.hit_horizon = True
                 return solver_mod._DepthSearchResult(
                     best_move=4,
                     score=3,
@@ -451,7 +451,7 @@ class TestEngine(unittest.TestCase):
         self.assertFalse(entry.proven)
 
         context = solver_mod._SearchContext(tt=tt, deadline=None)
-        _, proven = solver_mod._search_depth(state, -solver_mod.INF, solver_mod.INF, 2, context)
+        _, _, proven = solver_mod._search_depth(state, -solver_mod.INF, solver_mod.INF, 2, context)
         self.assertFalse(proven)
         self.assertTrue(context.used_unproven_exact_tt)
 
@@ -463,7 +463,7 @@ class TestEngine(unittest.TestCase):
         }
         context = solver_mod._SearchContext(tt=tt, deadline=None)
         solver_mod._search_depth(state, alpha=0, beta=1, depth=1, context=context)
-        self.assertFalse(context.hit_depth_limit)
+        self.assertFalse(context.hit_horizon)
         self.assertFalse(context.used_unproven_exact_tt)
 
     def test_tt_bound_cutoff_returns_window_consistent_value(self):
@@ -474,15 +474,21 @@ class TestEngine(unittest.TestCase):
             norm_state: TTEntry(5, solver_mod.LOWER, 1, depth=4, proven=False),
         }
         lower_context = solver_mod._SearchContext(tt=lower_tt, deadline=None)
-        lower_value, _ = solver_mod._search_depth(state, alpha=0, beta=1, depth=1, context=lower_context)
+        lower_value, lower_flag, _ = solver_mod._search_depth(
+            state, alpha=0, beta=1, depth=1, context=lower_context
+        )
         self.assertEqual(lower_value, 5)
+        self.assertEqual(lower_flag, solver_mod.LOWER)
 
         upper_tt = {
             norm_state: TTEntry(-5, solver_mod.UPPER, 1, depth=4, proven=False),
         }
         upper_context = solver_mod._SearchContext(tt=upper_tt, deadline=None)
-        upper_value, _ = solver_mod._search_depth(state, alpha=0, beta=1, depth=1, context=upper_context)
+        upper_value, upper_flag, _ = solver_mod._search_depth(
+            state, alpha=0, beta=1, depth=1, context=upper_context
+        )
         self.assertEqual(upper_value, -5)
+        self.assertEqual(upper_flag, solver_mod.UPPER)
 
     def test_quick_fallback_score_matches_selected_move_child(self):
         state = make_state(YOU, [1, 0, 0, 0, 0, 0], [0, 0, 0, 0, 0, 0], 0, 0)
@@ -542,8 +548,10 @@ class TestEngine(unittest.TestCase):
         def fake_search(child_state, alpha, beta, depth, _context):
             calls.append((child_state, alpha, beta))
             if alpha == -solver_mod.INF and beta == solver_mod.INF:
-                return (50 if child_state is child_a else 10, False)
-            return (beta if child_state is child_a else alpha, False)
+                return (50 if child_state is child_a else 10, solver_mod.EXACT, False)
+            if child_state is child_a:
+                return (beta, solver_mod.LOWER, False)
+            return (alpha, solver_mod.UPPER, False)
 
         try:
             solver_mod.ordered_children = fake_ordered_children

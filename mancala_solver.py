@@ -72,7 +72,7 @@ class SearchResult:
     nodes: int
 
 
-@dataclass
+@dataclass(slots=True)
 class _SearchContext:
     tt: Dict[State, TTEntry]
     deadline: Optional[float]
@@ -82,7 +82,7 @@ class _SearchContext:
     telemetry: Optional["_TelemetryStats"] = None
     iter_depth: int = 0
     nodes: int = 0
-    hit_depth_limit: bool = False
+    hit_horizon: bool = False
     used_unproven_exact_tt: bool = False
     interrupted: bool = False
 
@@ -550,7 +550,7 @@ def _decorate_depth_result(
 
 def _search_depth(
     state: State, alpha: int, beta: int, depth: int, context: _SearchContext
-) -> Tuple[int, bool]:
+) -> Tuple[int, int, bool]:
     _check_deadline(context)
     context.nodes += 1
     _telemetry_record_node(context, depth)
@@ -559,13 +559,13 @@ def _search_depth(
         context.live_nodes_callback(context.nodes)
 
     if is_terminal(state):
-        return terminal_diff(state), True
+        return terminal_diff(state), EXACT, True
 
     if depth <= 0:
-        context.hit_depth_limit = True
+        context.hit_horizon = True
         if context.telemetry is not None:
             context.telemetry.eval_calls += 1
-        return _heuristic_eval(state), False
+        return _heuristic_eval(state), EXACT, False
 
     alpha0, beta0 = alpha, beta
     norm_state, sign = normalize_state(state)
@@ -580,9 +580,8 @@ def _search_depth(
             if context.telemetry is not None:
                 context.telemetry.tt_exact_reuse += 1
             if not entry.proven:
-                context.hit_depth_limit = True
                 context.used_unproven_exact_tt = True
-            return value, entry.proven
+            return value, EXACT, entry.proven
         if context.telemetry is not None:
             context.telemetry.tt_bound_reuse += 1
         if flag == LOWER:
@@ -592,15 +591,15 @@ def _search_depth(
         if alpha >= beta:
             _telemetry_record_cutoff(context, depth, "tt_bound")
             if flag == LOWER:
-                return alpha, False
-            return beta, False
+                return alpha, LOWER, False
+            return beta, UPPER, False
 
     children = ordered_children(state, context.tt, context=context)
     if context.telemetry is not None:
         context.telemetry.branching_sum += len(children)
         context.telemetry.branching_samples += 1
     if not children:
-        return terminal_diff(state), True
+        return terminal_diff(state), EXACT, True
 
     best_move: Optional[int] = None
     best_proven = False
@@ -608,7 +607,7 @@ def _search_depth(
     if state.to_move == YOU:
         best = -INF
         for move, child_state, _, _, _ in children:
-            val, val_proven = _search_depth(child_state, alpha, beta, depth - 1, context)
+            val, _, val_proven = _search_depth(child_state, alpha, beta, depth - 1, context)
             all_children_proven = all_children_proven and val_proven
             if val > best or (val == best and val_proven and not best_proven):
                 best = val
@@ -621,7 +620,7 @@ def _search_depth(
     else:
         best = INF
         for move, child_state, _, _, _ in children:
-            val, val_proven = _search_depth(child_state, alpha, beta, depth - 1, context)
+            val, _, val_proven = _search_depth(child_state, alpha, beta, depth - 1, context)
             all_children_proven = all_children_proven and val_proven
             if val < best or (val == best and val_proven and not best_proven):
                 best = val
@@ -653,7 +652,7 @@ def _search_depth(
         TTEntry(value_norm, flag_norm, best_move_norm, depth, exact_proven),
         on_mutation=context.tt_mutation_callback,
     )
-    return best, exact_proven
+    return best, flag, exact_proven
 
 
 def search_depth(
@@ -699,11 +698,11 @@ def _best_move_depth(
             _check_deadline(context)
             move_alpha = alpha_root
             move_beta = beta_root
-            val, _ = _search_depth(child_state, move_alpha, move_beta, depth - 1, context)
-            if val <= move_alpha or val >= move_beta:
+            val, val_flag, _ = _search_depth(child_state, move_alpha, move_beta, depth - 1, context)
+            if val_flag != EXACT:
                 # Move result is a bound in this aspiration window; re-search for an exact score.
                 _check_deadline(context)
-                val, _ = _search_depth(child_state, -INF, INF, depth - 1, context)
+                val, _, _ = _search_depth(child_state, -INF, INF, depth - 1, context)
             scored.append((move, val))
             alpha_root = max(alpha_root, val)
         scored.sort(key=lambda item: item[1], reverse=True)
@@ -712,11 +711,11 @@ def _best_move_depth(
             _check_deadline(context)
             move_alpha = alpha_root
             move_beta = beta_root
-            val, _ = _search_depth(child_state, move_alpha, move_beta, depth - 1, context)
-            if val <= move_alpha or val >= move_beta:
+            val, val_flag, _ = _search_depth(child_state, move_alpha, move_beta, depth - 1, context)
+            if val_flag != EXACT:
                 # Move result is a bound in this aspiration window; re-search for an exact score.
                 _check_deadline(context)
-                val, _ = _search_depth(child_state, -INF, INF, depth - 1, context)
+                val, _, _ = _search_depth(child_state, -INF, INF, depth - 1, context)
             scored.append((move, val))
             beta_root = min(beta_root, val)
         scored.sort(key=lambda item: item[1])
@@ -982,7 +981,7 @@ def solve_best_move(
             score=depth_result.score,
             top_moves=depth_result.top_moves,
             depth=0,
-            complete=(not context.hit_depth_limit),
+            complete=(not context.hit_horizon and not context.used_unproven_exact_tt),
             elapsed_ms=elapsed_ms,
             nodes=context.nodes,
         )
@@ -1037,7 +1036,7 @@ def solve_best_move(
             score=depth_result.score,
             top_moves=depth_result.top_moves,
             depth=depth,
-            complete=(not context.hit_depth_limit),
+            complete=(not context.hit_horizon and not context.used_unproven_exact_tt),
             elapsed_ms=elapsed_ms,
             nodes=total_nodes,
         )
