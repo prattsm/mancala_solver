@@ -544,12 +544,21 @@ class TestEngine(unittest.TestCase):
         self.assertFalse(context.hit_horizon)
         self.assertFalse(context.used_unproven_exact_tt)
 
+    def test_unproven_bound_tt_is_not_used_for_cutoff(self):
+        state = make_state(YOU, [1, 0, 0, 0, 0, 0], [1, 0, 0, 0, 0, 0], 0, 0)
+        norm_state, _ = solver_mod.normalize_state(state)
+        tt = {
+            norm_state: TTEntry(999, solver_mod.LOWER, 1, depth=6, proven=False),
+        }
+        value = solver_mod.search_depth(state, depth=2, tt=tt, alpha=0, beta=1)
+        self.assertNotEqual(value, 999)
+
     def test_tt_bound_cutoff_returns_window_consistent_value(self):
         state = make_state(YOU, [1, 0, 0, 0, 0, 0], [1, 0, 0, 0, 0, 0], 0, 0)
         norm_state, _ = solver_mod.normalize_state(state)
 
         lower_tt = {
-            norm_state: TTEntry(5, solver_mod.LOWER, 1, depth=4, proven=False),
+            norm_state: TTEntry(5, solver_mod.LOWER, 1, depth=4, proven=True),
         }
         lower_context = solver_mod._SearchContext(tt=lower_tt, deadline_ns=None)
         lower_value, lower_flag, _ = solver_mod._search_depth(
@@ -559,7 +568,7 @@ class TestEngine(unittest.TestCase):
         self.assertEqual(lower_flag, solver_mod.LOWER)
 
         upper_tt = {
-            norm_state: TTEntry(-5, solver_mod.UPPER, 1, depth=4, proven=False),
+            norm_state: TTEntry(-5, solver_mod.UPPER, 1, depth=4, proven=True),
         }
         upper_context = solver_mod._SearchContext(tt=upper_tt, deadline_ns=None)
         upper_value, upper_flag, _ = solver_mod._search_depth(

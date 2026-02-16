@@ -412,7 +412,7 @@ def ordered_children(
     def _poll_sow() -> None:
         if context is None:
             return
-        _check_deadline(context)
+        _check_deadline(context, force_interrupt=True)
 
     best_first = _tt_best_move(state, tt)
     children: List[Tuple[int, State, bool, bool, int]] = []
@@ -649,16 +649,13 @@ def _search_depth(
         if context.telemetry is not None:
             context.telemetry.tt_hits += 1
         value, flag = denormalize_value_flag(entry.value, entry.flag, sign)
-        if flag == EXACT:
-            if entry.proven:
+        if entry.proven:
+            if flag == EXACT:
                 if context.telemetry is not None:
                     context.telemetry.tt_exact_reuse += 1
                 return value, EXACT, True
-            # Unproven exact entries are useful for move ordering only.
-            context.used_unproven_exact_tt = True
-        if context.telemetry is not None:
-            context.telemetry.tt_bound_reuse += 1
-        if flag != EXACT:
+            if context.telemetry is not None:
+                context.telemetry.tt_bound_reuse += 1
             if flag == LOWER:
                 alpha = max(alpha, value)
             elif flag == UPPER:
@@ -668,6 +665,9 @@ def _search_depth(
                 if flag == LOWER:
                     return alpha, LOWER, False
                 return beta, UPPER, False
+        elif flag == EXACT:
+            # Unproven exact entries are useful for move ordering only.
+            context.used_unproven_exact_tt = True
 
     children = ordered_children(state, context.tt, context=context, depth_remaining=depth)
     if context.telemetry is not None:
@@ -1087,7 +1087,7 @@ def solve_best_move(
             score=depth_result.score,
             top_moves=depth_result.top_moves,
             depth=0,
-            complete=(depth_result.proven and not context.hit_horizon),
+            complete=(not context.hit_horizon),
             elapsed_ms=elapsed_ms,
             nodes=context.nodes,
             tt_stores=context.tt_stores,
@@ -1156,7 +1156,7 @@ def solve_best_move(
             score=depth_result.score,
             top_moves=depth_result.top_moves,
             depth=depth,
-            complete=(depth_result.proven and not context.hit_horizon),
+            complete=(not context.hit_horizon),
             elapsed_ms=elapsed_ms,
             nodes=total_nodes,
             tt_stores=total_tt_stores,
