@@ -770,12 +770,8 @@ def _best_move_depth(
             move_alpha = alpha_root
             move_beta = beta_root
             val, val_flag, _ = _search_depth(child_state, move_alpha, move_beta, depth - 1, context)
-            needs_exact = (
-                val_flag == LOWER
-                or (val_flag == UPPER and val > alpha_root)
-            )
-            if needs_exact:
-                # Move result is a bound in this aspiration window; re-search for an exact score.
+            if val_flag != EXACT:
+                # Keep root move scores exact so top-move display/ranking is stable.
                 _check_deadline(context)
                 val, _, _ = _search_depth(child_state, -INF, INF, depth - 1, context)
             scored.append((move, val))
@@ -787,12 +783,8 @@ def _best_move_depth(
             move_alpha = alpha_root
             move_beta = beta_root
             val, val_flag, _ = _search_depth(child_state, move_alpha, move_beta, depth - 1, context)
-            needs_exact = (
-                val_flag == UPPER
-                or (val_flag == LOWER and val < beta_root)
-            )
-            if needs_exact:
-                # Move result is a bound in this aspiration window; re-search for an exact score.
+            if val_flag != EXACT:
+                # Keep root move scores exact so top-move display/ranking is stable.
                 _check_deadline(context)
                 val, _, _ = _search_depth(child_state, -INF, INF, depth - 1, context)
             scored.append((move, val))
