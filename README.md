@@ -54,9 +54,15 @@ python3 bench_solver.py --positions 20 --time-ms 300
 
 Optional benchmark flags:
 - `--perfect` run full-depth solves
+- `--depth N` fixed-depth search mode (more deterministic than time slicing)
 - `--reuse-tt` reuse one TT across positions
 - `--seed N` deterministic position generation seed
 - `--max-plies N` max random plies from start state
+- `--repeat N` repeat benchmark runs and print p50/p95 summaries
+- `--warmup N` warmup solves per repeat (not counted in summary)
+- `--no-gc` disable garbage collection during measured loop
+- `--save-positions FILE` save sampled positions as stable state keys
+- `--load-positions FILE` benchmark a saved dataset (reproducible across code changes)
 
 ## Tests
 ```bash
