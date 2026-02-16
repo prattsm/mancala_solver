@@ -26,7 +26,7 @@ jobs:
           python -m pip install pyside6
 
       - name: Compile check
-        run: python -m py_compile cli.py mancala_engine.py mancala_solver.py mancala_gui.py
+        run: python -m py_compile cli.py bench_solver.py mancala_engine.py mancala_solver.py mancala_gui.py
 
       - name: Run tests
         run: python -m unittest discover -s tests -v

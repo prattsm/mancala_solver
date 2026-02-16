@@ -478,7 +478,7 @@ class TestEngine(unittest.TestCase):
         self.assertEqual(entry.flag, EXACT)
         self.assertFalse(entry.proven)
 
-        context = solver_mod._SearchContext(tt=tt, deadline=None)
+        context = solver_mod._SearchContext(tt=tt, deadline_ns=None)
         _, _, proven = solver_mod._search_depth(state, -solver_mod.INF, solver_mod.INF, 2, context)
         self.assertFalse(proven)
         self.assertTrue(context.used_unproven_exact_tt)
@@ -489,7 +489,7 @@ class TestEngine(unittest.TestCase):
         tt = {
             norm_state: TTEntry(1, solver_mod.LOWER, 1, depth=4, proven=False),
         }
-        context = solver_mod._SearchContext(tt=tt, deadline=None)
+        context = solver_mod._SearchContext(tt=tt, deadline_ns=None)
         solver_mod._search_depth(state, alpha=0, beta=1, depth=1, context=context)
         self.assertFalse(context.hit_horizon)
         self.assertFalse(context.used_unproven_exact_tt)
@@ -501,7 +501,7 @@ class TestEngine(unittest.TestCase):
         lower_tt = {
             norm_state: TTEntry(5, solver_mod.LOWER, 1, depth=4, proven=False),
         }
-        lower_context = solver_mod._SearchContext(tt=lower_tt, deadline=None)
+        lower_context = solver_mod._SearchContext(tt=lower_tt, deadline_ns=None)
         lower_value, lower_flag, _ = solver_mod._search_depth(
             state, alpha=0, beta=1, depth=1, context=lower_context
         )
@@ -511,7 +511,7 @@ class TestEngine(unittest.TestCase):
         upper_tt = {
             norm_state: TTEntry(-5, solver_mod.UPPER, 1, depth=4, proven=False),
         }
-        upper_context = solver_mod._SearchContext(tt=upper_tt, deadline=None)
+        upper_context = solver_mod._SearchContext(tt=upper_tt, deadline_ns=None)
         upper_value, upper_flag, _ = solver_mod._search_depth(
             state, alpha=0, beta=1, depth=1, context=upper_context
         )
@@ -565,12 +565,12 @@ class TestEngine(unittest.TestCase):
             (1, child_a, False, False, 0),
             (2, child_b, False, False, 0),
         ]
-        context = solver_mod._SearchContext(tt={}, deadline=None)
+        context = solver_mod._SearchContext(tt={}, deadline_ns=None)
         original_children = solver_mod.ordered_children
         original_search = solver_mod._search_depth
         calls = []
 
-        def fake_ordered_children(_state, _tt, context=None):
+        def fake_ordered_children(_state, _tt, context=None, depth_remaining=None):
             return fake_children
 
         def fake_search(child_state, alpha, beta, depth, _context):

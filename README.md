@@ -47,6 +47,17 @@ Demo mode (visualizer drives the solver itself):
 python3 mancala_visualizer.py --demo
 ```
 
+## Run (Benchmark)
+```bash
+python3 bench_solver.py --positions 20 --time-ms 300
+```
+
+Optional benchmark flags:
+- `--perfect` run full-depth solves
+- `--reuse-tt` reuse one TT across positions
+- `--seed N` deterministic position generation seed
+- `--max-plies N` max random plies from start state
+
 ## Tests
 ```bash
 python3 -m unittest discover -s tests

@@ -47,6 +47,11 @@ CACHE_GZIP_LEVEL = 1
 CHILDGEN_POLL_MASK = 0x07
 SOW_POLL_MASK = 0x1F
 SLICE_DEADLINE_SLACK_MS = 15
+SLICE_DEADLINE_SLACK_NS = SLICE_DEADLINE_SLACK_MS * 1_000_000
+KILLER_PRIMARY_BONUS = 100
+KILLER_SECONDARY_BONUS = 50
+HISTORY_DIVISOR = 8
+ORDERING_DEPTH_CAP = 64
 
 EXACT = 0
 LOWER = 1
@@ -76,11 +81,13 @@ class SearchResult:
 @dataclass(slots=True)
 class _SearchContext:
     tt: Dict[State, TTEntry]
-    deadline: Optional[float]
+    deadline_ns: Optional[int]
     interrupt_check: Optional[Callable[[], bool]] = None
     tt_mutation_callback: Optional[Callable[[], None]] = None
     live_nodes_callback: Optional[Callable[[int], None]] = None
     telemetry: Optional["_TelemetryStats"] = None
+    killer_moves: Dict[int, Tuple[Optional[int], Optional[int]]] = field(default_factory=dict)
+    history_scores: Dict[Tuple[str, int], int] = field(default_factory=dict)
     iter_depth: int = 0
     nodes: int = 0
     hit_horizon: bool = False
@@ -171,15 +178,19 @@ def _prune_tt(tt: Dict[State, TTEntry]) -> bool:
         return False
 
     # Prefer keeping deeper/exact/proven entries when pruning.
-    worst = heapq.nsmallest(
-        remove_count,
-        tt.items(),
-        key=lambda item: (
-            item[1].depth,
-            1 if item[1].flag == EXACT else 0,
-            1 if item[1].proven else 0,
-        ),
-    )
+    def _prune_key(item: Tuple[State, TTEntry]) -> Tuple[int, int, int]:
+        entry = item[1]
+        return (
+            entry.depth,
+            1 if entry.flag == EXACT else 0,
+            1 if entry.proven else 0,
+        )
+
+    # heapq is best when removing a small fraction; sort wins for larger cuts.
+    if remove_count * 4 <= size:
+        worst = heapq.nsmallest(remove_count, tt.items(), key=_prune_key)
+    else:
+        worst = sorted(tt.items(), key=_prune_key)[:remove_count]
     for state, _ in worst:
         tt.pop(state, None)
     return True
@@ -359,10 +370,29 @@ def _tt_best_move(state: State, tt: Dict[State, TTEntry]) -> Optional[int]:
     return denormalize_move(entry.best_move, sign)
 
 
+def _record_killer(context: _SearchContext, depth_remaining: int, move: int) -> None:
+    if depth_remaining <= 0:
+        return
+    depth_bucket = min(depth_remaining, ORDERING_DEPTH_CAP)
+    first, second = context.killer_moves.get(depth_bucket, (None, None))
+    if first == move:
+        return
+    context.killer_moves[depth_bucket] = (move, first if first != move else second)
+
+
+def _record_history(context: _SearchContext, side: str, move: int, depth_remaining: int) -> None:
+    if depth_remaining <= 0:
+        return
+    key = (side, move)
+    depth_bucket = min(depth_remaining, ORDERING_DEPTH_CAP)
+    context.history_scores[key] = context.history_scores.get(key, 0) + (depth_bucket * depth_bucket)
+
+
 def ordered_children(
     state: State,
     tt: Dict[State, TTEntry],
     context: Optional[_SearchContext] = None,
+    depth_remaining: Optional[int] = None,
 ) -> List[Tuple[int, State, bool, bool, int]]:
     moves = legal_moves(state)
     if not moves:
@@ -372,7 +402,7 @@ def ordered_children(
         if context is None:
             return
         if (index & CHILDGEN_POLL_MASK) == 0:
-            _check_deadline(context)
+            _check_deadline(context, force_interrupt=True)
 
     def _poll_sow() -> None:
         if context is None:
@@ -397,7 +427,16 @@ def ordered_children(
             store_gain = child_state.store_opp - state.store_opp
         children.append((best_first, child_state, extra_turn, capture, store_gain))
 
-    rest: List[Tuple[int, State, bool, bool, int]] = []
+    use_heuristics = context is not None and depth_remaining is not None and depth_remaining > 1
+    killer_first: Optional[int] = None
+    killer_second: Optional[int] = None
+    history_scores: Optional[Dict[Tuple[str, int], int]] = None
+    if use_heuristics:
+        depth_bucket = min(depth_remaining, ORDERING_DEPTH_CAP)
+        killer_first, killer_second = context.killer_moves.get(depth_bucket, (None, None))
+        history_scores = context.history_scores
+
+    rest: List[Tuple[int, State, bool, bool, int, int]] = []
     for idx, move in enumerate(rest_moves, start=1):
         _poll_childgen(idx)
         child_state, extra_turn, capture = apply_move_fast_with_info(
@@ -410,14 +449,28 @@ def ordered_children(
             store_gain = child_state.store_you - state.store_you
         else:
             store_gain = child_state.store_opp - state.store_opp
-        rest.append((move, child_state, extra_turn, capture, store_gain))
+        order_bonus = store_gain * 10
+        if extra_turn:
+            order_bonus += 1_000
+        if capture:
+            order_bonus += 500
+        if use_heuristics:
+            if move == killer_first:
+                order_bonus += KILLER_PRIMARY_BONUS
+            elif move == killer_second:
+                order_bonus += KILLER_SECONDARY_BONUS
+            history = history_scores.get((state.to_move, move), 0) if history_scores is not None else 0
+            if history > 0:
+                order_bonus += history // HISTORY_DIVISOR
+        rest.append((move, child_state, extra_turn, capture, store_gain, order_bonus))
 
-    rest.sort(key=lambda item: (item[2], item[3], item[4]), reverse=True)
-    return children + rest if children else rest
+    rest.sort(key=lambda item: item[5], reverse=True)
+    ordered_rest = [(move, child_state, extra_turn, capture, store_gain) for move, child_state, extra_turn, capture, store_gain, _ in rest]
+    return children + ordered_rest if children else ordered_rest
 
 
 def _check_deadline(context: _SearchContext, force_interrupt: bool = False) -> None:
-    if context.deadline is not None and time.perf_counter() >= context.deadline:
+    if context.deadline_ns is not None and time.perf_counter_ns() >= context.deadline_ns:
         raise SearchTimeout()
     if (
         context.interrupt_check is not None
@@ -608,7 +661,7 @@ def _search_depth(
                 return alpha, LOWER, False
             return beta, UPPER, False
 
-    children = ordered_children(state, context.tt, context=context)
+    children = ordered_children(state, context.tt, context=context, depth_remaining=depth)
     if context.telemetry is not None:
         context.telemetry.branching_sum += len(children)
         context.telemetry.branching_samples += 1
@@ -629,6 +682,8 @@ def _search_depth(
                 best_proven = val_proven
             alpha = max(alpha, best)
             if alpha >= beta:
+                _record_killer(context, depth, move)
+                _record_history(context, state.to_move, move, depth)
                 _telemetry_record_cutoff(context, depth, "alpha_beta")
                 break
     else:
@@ -642,6 +697,8 @@ def _search_depth(
                 best_proven = val_proven
             beta = min(beta, best)
             if alpha >= beta:
+                _record_killer(context, depth, move)
+                _record_history(context, state.to_move, move, depth)
                 _telemetry_record_cutoff(context, depth, "alpha_beta")
                 break
 
@@ -676,7 +733,7 @@ def search_depth(
     alpha: int = -INF,
     beta: int = INF,
 ) -> int:
-    context = _SearchContext(tt=tt, deadline=None, interrupt_check=None)
+    context = _SearchContext(tt=tt, deadline_ns=None, interrupt_check=None)
     return _search_depth(state, alpha, beta, max(0, depth), context)[0]
 
 
@@ -692,7 +749,7 @@ def _best_move_depth(
     alpha: int = -INF,
     beta: int = INF,
 ) -> _DepthSearchResult:
-    children = ordered_children(state, context.tt, context=context)
+    children = ordered_children(state, context.tt, context=context, depth_remaining=depth)
     if not children:
         score = terminal_diff(state)
         return _DepthSearchResult(
@@ -713,7 +770,11 @@ def _best_move_depth(
             move_alpha = alpha_root
             move_beta = beta_root
             val, val_flag, _ = _search_depth(child_state, move_alpha, move_beta, depth - 1, context)
-            if val_flag != EXACT:
+            needs_exact = (
+                val_flag == LOWER
+                or (val_flag == UPPER and val > alpha_root)
+            )
+            if needs_exact:
                 # Move result is a bound in this aspiration window; re-search for an exact score.
                 _check_deadline(context)
                 val, _, _ = _search_depth(child_state, -INF, INF, depth - 1, context)
@@ -726,7 +787,11 @@ def _best_move_depth(
             move_alpha = alpha_root
             move_beta = beta_root
             val, val_flag, _ = _search_depth(child_state, move_alpha, move_beta, depth - 1, context)
-            if val_flag != EXACT:
+            needs_exact = (
+                val_flag == UPPER
+                or (val_flag == LOWER and val < beta_root)
+            )
+            if needs_exact:
                 # Move result is a bound in this aspiration window; re-search for an exact score.
                 _check_deadline(context)
                 val, _, _ = _search_depth(child_state, -INF, INF, depth - 1, context)
@@ -866,7 +931,7 @@ def solve_best_move(
             return
         # Force one final batch so dashboards don't stall between iterations.
         _telemetry_maybe_emit_batch(
-            _SearchContext(tt=tt, deadline=None, telemetry=telemetry),
+            _SearchContext(tt=tt, deadline_ns=None, telemetry=telemetry),
             force=True,
         )
         emit_dataclass_event(
@@ -968,13 +1033,17 @@ def solve_best_move(
 
     if time_limit_ms is None:
         _emit_iteration_start(depth=0, guess=None)
+        killer_moves: Dict[int, Tuple[Optional[int], Optional[int]]] = {}
+        history_scores: Dict[Tuple[str, int], int] = {}
         context = _SearchContext(
             tt=tt,
-            deadline=None,
+            deadline_ns=None,
             interrupt_check=interrupt_check,
             tt_mutation_callback=tt_mutation_callback,
             live_nodes_callback=_emit_live,
             telemetry=telemetry,
+            killer_moves=killer_moves,
+            history_scores=history_scores,
             iter_depth=FULL_DEPTH,
         )
         try:
@@ -1027,28 +1096,32 @@ def solve_best_move(
         )
         return result
 
-    deadline = start + max(0, time_limit_ms) / 1000.0
-    hard_deadline = deadline + (SLICE_DEADLINE_SLACK_MS / 1000.0)
+    deadline_ns = time.perf_counter_ns() + (max(0, time_limit_ms) * 1_000_000)
+    hard_deadline_ns = deadline_ns + SLICE_DEADLINE_SLACK_NS
     total_nodes = 0
     best_result: Optional[SearchResult] = None
     best_result_hit_horizon = False
     best_result_used_unproven_exact_tt = False
+    killer_moves: Dict[int, Tuple[Optional[int], Optional[int]]] = {}
+    history_scores: Dict[Tuple[str, int], int] = {}
     depth = max(1, start_depth)
     current_guess = guess_score
     timed_out_due_interrupt = False
 
     while True:
-        if time.perf_counter() >= deadline:
+        if time.perf_counter_ns() >= deadline_ns:
             break
 
         _emit_iteration_start(depth=depth, guess=current_guess)
         context = _SearchContext(
             tt=tt,
-            deadline=hard_deadline,
+            deadline_ns=hard_deadline_ns,
             interrupt_check=interrupt_check,
             tt_mutation_callback=tt_mutation_callback,
             live_nodes_callback=lambda iter_nodes, base_nodes=total_nodes: _emit_live(base_nodes + iter_nodes),
             telemetry=telemetry,
+            killer_moves=killer_moves,
+            history_scores=history_scores,
             iter_depth=depth,
         )
         try:
