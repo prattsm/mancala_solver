@@ -43,8 +43,8 @@ TELEMETRY_NODE_MASK = 0x3FF
 TELEMETRY_DEPTH_SAMPLE_MASK = 0x7
 TELEMETRY_EMIT_INTERVAL_MS = 120
 CACHE_GZIP_LEVEL = 1
-CHILDGEN_POLL_MASK = 0x0
-SOW_POLL_MASK = 0x0F
+CHILDGEN_POLL_MASK = 0x07
+SOW_POLL_MASK = 0x1F
 SLICE_DEADLINE_SLACK_MS = 15
 
 EXACT = 0
@@ -52,7 +52,7 @@ LOWER = 1
 UPPER = 2
 
 
-@dataclass(frozen=True)
+@dataclass(frozen=True, slots=True)
 class TTEntry:
     value: int
     flag: int
@@ -83,7 +83,7 @@ class _SearchContext:
     iter_depth: int = 0
     nodes: int = 0
     hit_depth_limit: bool = False
-    used_unproven_tt: bool = False
+    used_unproven_exact_tt: bool = False
     interrupted: bool = False
 
 
@@ -358,12 +358,12 @@ def ordered_children(
         if context is None:
             return
         if (index & CHILDGEN_POLL_MASK) == 0:
-            _check_deadline(context, force=True)
+            _check_deadline(context)
 
     def _poll_sow() -> None:
         if context is None:
             return
-        _check_deadline(context, force=True)
+        _check_deadline(context)
 
     best_first = _tt_best_move(state, tt)
     children: List[Tuple[int, State, bool, bool, int]] = []
@@ -402,15 +402,15 @@ def ordered_children(
     return children + rest if children else rest
 
 
-def _check_deadline(context: _SearchContext, force: bool = False) -> None:
+def _check_deadline(context: _SearchContext, force_interrupt: bool = False) -> None:
+    if context.deadline is not None and time.perf_counter() >= context.deadline:
+        raise SearchTimeout()
     if (
         context.interrupt_check is not None
-        and (force or (context.nodes & INTERRUPT_POLL_MASK) == 0)
+        and (force_interrupt or (context.nodes & INTERRUPT_POLL_MASK) == 0)
         and context.interrupt_check()
     ):
         context.interrupted = True
-        raise SearchTimeout()
-    if context.deadline is not None and time.perf_counter() >= context.deadline:
         raise SearchTimeout()
 
 
@@ -581,7 +581,7 @@ def _search_depth(
                 context.telemetry.tt_exact_reuse += 1
             if not entry.proven:
                 context.hit_depth_limit = True
-                context.used_unproven_tt = True
+                context.used_unproven_exact_tt = True
             return value, entry.proven
         if context.telemetry is not None:
             context.telemetry.tt_bound_reuse += 1
@@ -591,7 +591,9 @@ def _search_depth(
             beta = min(beta, value)
         if alpha >= beta:
             _telemetry_record_cutoff(context, depth, "tt_bound")
-            return value, False
+            if flag == LOWER:
+                return alpha, False
+            return beta, False
 
     children = ordered_children(state, context.tt, context=context)
     if context.telemetry is not None:
@@ -694,26 +696,26 @@ def _best_move_depth(
     beta_root = beta
     if state.to_move == YOU:
         for move, child_state, _, _, _ in children:
-            _check_deadline(context, force=True)
+            _check_deadline(context)
             move_alpha = alpha_root
             move_beta = beta_root
             val, _ = _search_depth(child_state, move_alpha, move_beta, depth - 1, context)
             if val <= move_alpha or val >= move_beta:
                 # Move result is a bound in this aspiration window; re-search for an exact score.
-                _check_deadline(context, force=True)
+                _check_deadline(context)
                 val, _ = _search_depth(child_state, -INF, INF, depth - 1, context)
             scored.append((move, val))
             alpha_root = max(alpha_root, val)
         scored.sort(key=lambda item: item[1], reverse=True)
     else:
         for move, child_state, _, _, _ in children:
-            _check_deadline(context, force=True)
+            _check_deadline(context)
             move_alpha = alpha_root
             move_beta = beta_root
             val, _ = _search_depth(child_state, move_alpha, move_beta, depth - 1, context)
             if val <= move_alpha or val >= move_beta:
                 # Move result is a bound in this aspiration window; re-search for an exact score.
-                _check_deadline(context, force=True)
+                _check_deadline(context)
                 val, _ = _search_depth(child_state, -INF, INF, depth - 1, context)
             scored.append((move, val))
             beta_root = min(beta_root, val)
@@ -988,7 +990,7 @@ def solve_best_move(
         if progress_callback is not None:
             progress_callback(result)
         _emit_iteration_done(depth=0, depth_result=depth_result, result=result)
-        _emit_search_end(result, "complete" if result.complete else "timeout")
+        _emit_search_end(result, "complete" if result.complete else "depth_limit")
         return result
 
     deadline = start + max(0, time_limit_ms) / 1000.0

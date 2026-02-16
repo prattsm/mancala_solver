@@ -68,6 +68,34 @@ class TestTelemetry(unittest.TestCase):
         self.assertTrue(search_end_events)
         self.assertEqual(search_end_events[-1].data.get("reason"), "timeout")
 
+    def test_search_end_reason_depth_limit_for_full_solve_heuristic(self):
+        sink = _CollectSink()
+        state = initial_state(seeds=2, you_first=True)
+
+        def fake_best_move_depth(_state, _topn, _depth, context, _alpha, _beta):
+            context.hit_depth_limit = True
+            return solver_mod._DepthSearchResult(
+                best_move=1,
+                score=0,
+                top_moves=[(1, 0)],
+                fail_low=False,
+                fail_high=False,
+            )
+
+        with patch.object(solver_mod, "_best_move_depth", fake_best_move_depth):
+            result = solver_mod.solve_best_move(
+                state,
+                topn=3,
+                tt={},
+                time_limit_ms=None,
+                telemetry_sink=sink,
+            )
+
+        self.assertFalse(result.complete)
+        search_end_events = [event for event in sink.events if event.event == "search_end"]
+        self.assertTrue(search_end_events)
+        self.assertEqual(search_end_events[-1].data.get("reason"), "depth_limit")
+
 
 if __name__ == "__main__":
     unittest.main()

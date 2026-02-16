@@ -453,7 +453,7 @@ class TestEngine(unittest.TestCase):
         context = solver_mod._SearchContext(tt=tt, deadline=None)
         _, proven = solver_mod._search_depth(state, -solver_mod.INF, solver_mod.INF, 2, context)
         self.assertFalse(proven)
-        self.assertTrue(context.used_unproven_tt)
+        self.assertTrue(context.used_unproven_exact_tt)
 
     def test_unproven_bound_tt_does_not_mark_depth_limit(self):
         state = make_state(YOU, [1, 0, 0, 0, 0, 0], [1, 0, 0, 0, 0, 0], 0, 0)
@@ -464,7 +464,25 @@ class TestEngine(unittest.TestCase):
         context = solver_mod._SearchContext(tt=tt, deadline=None)
         solver_mod._search_depth(state, alpha=0, beta=1, depth=1, context=context)
         self.assertFalse(context.hit_depth_limit)
-        self.assertFalse(context.used_unproven_tt)
+        self.assertFalse(context.used_unproven_exact_tt)
+
+    def test_tt_bound_cutoff_returns_window_consistent_value(self):
+        state = make_state(YOU, [1, 0, 0, 0, 0, 0], [1, 0, 0, 0, 0, 0], 0, 0)
+        norm_state, _ = solver_mod.normalize_state(state)
+
+        lower_tt = {
+            norm_state: TTEntry(5, solver_mod.LOWER, 1, depth=4, proven=False),
+        }
+        lower_context = solver_mod._SearchContext(tt=lower_tt, deadline=None)
+        lower_value, _ = solver_mod._search_depth(state, alpha=0, beta=1, depth=1, context=lower_context)
+        self.assertEqual(lower_value, 5)
+
+        upper_tt = {
+            norm_state: TTEntry(-5, solver_mod.UPPER, 1, depth=4, proven=False),
+        }
+        upper_context = solver_mod._SearchContext(tt=upper_tt, deadline=None)
+        upper_value, _ = solver_mod._search_depth(state, alpha=0, beta=1, depth=1, context=upper_context)
+        self.assertEqual(upper_value, -5)
 
     def test_quick_fallback_score_matches_selected_move_child(self):
         state = make_state(YOU, [1, 0, 0, 0, 0, 0], [0, 0, 0, 0, 0, 0], 0, 0)
